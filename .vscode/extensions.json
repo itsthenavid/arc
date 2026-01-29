@@ -1,0 +1,12 @@
+{
+  "recommendations": [
+    "golang.go",
+    "dart-code.dart-code",
+    "dart-code.flutter",
+    "editorconfig.editorconfig",
+    "ms-azuretools.vscode-docker",
+    "redhat.vscode-yaml",
+    "timonwong.shellcheck",
+    "streetsidesoftware.code-spell-checker"
+  ]
+}

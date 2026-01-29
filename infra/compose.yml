@@ -1,0 +1,51 @@
+name: arc
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: arc-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-arc}
+      POSTGRES_USER: ${POSTGRES_USER:-arc}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-arc_dev_password}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - arc_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-arc} -d ${POSTGRES_DB:-arc}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    container_name: arc-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - arc_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  dev:
+    image: mcr.microsoft.com/devcontainers/base:ubuntu-24.04
+    container_name: arc-dev
+    volumes:
+      - ./:/workspaces/arc:cached
+    command: sleep infinity
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  arc_postgres_data:
+  arc_redis_data:

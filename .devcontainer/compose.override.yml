@@ -1,0 +1,7 @@
+services:
+  dev:
+    image: mcr.microsoft.com/devcontainers/base:ubuntu-24.04
+    container_name: arc-dev
+    volumes:
+      - ..:/workspaces/arc:cached
+    command: sleep infinity

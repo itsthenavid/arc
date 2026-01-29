@@ -1,0 +1,12 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    { "label": "Arc: Doctor", "type": "shell", "command": "bash tools/scripts/doctor.sh" },
+    { "label": "Arc: Infra Up", "type": "shell", "command": "bash tools/scripts/infra-up.sh" },
+    { "label": "Arc: Infra Down", "type": "shell", "command": "bash tools/scripts/infra-down.sh" },
+    { "label": "Arc: Format", "type": "shell", "command": "bash tools/scripts/fmt.sh" },
+    { "label": "Arc: Lint", "type": "shell", "command": "bash tools/scripts/lint.sh" },
+    { "label": "Arc: Test", "type": "shell", "command": "bash tools/scripts/test.sh" },
+    { "label": "Arc: Local CI", "type": "shell", "command": "bash tools/scripts/ci-local.sh" }
+  ]
+}

@@ -1,0 +1,9 @@
+services:
+  postgres:
+    environment:
+      # Developer-friendly default; override via env if needed.
+      TZ: UTC
+
+  redis:
+    environment:
+      TZ: UTC

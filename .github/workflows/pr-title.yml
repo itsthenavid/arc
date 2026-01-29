@@ -1,0 +1,41 @@
+name: PR Title
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  title:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR title (Conventional Commits)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = context.payload.pull_request.title;
+
+            // Conventional Commit types we accept for Arc
+            const types = [
+              "feat", "fix", "docs", "chore", "refactor", "test", "ci", "perf", "build", "revert"
+            ];
+
+            // Format: type(optional-scope): subject
+            // Examples:
+            // - chore: scaffold phase-0 foundation
+            // - feat(auth): add session issuance
+            const re = new RegExp(`^(${types.join("|")})(\\([a-z0-9\\-]+\\))?:\\s.{1,80}$`);
+
+            if (!re.test(title)) {
+              core.setFailed(
+                `Invalid PR title.\n` +
+                `Expected Conventional Commits: type(scope?): subject\n` +
+                `Allowed types: ${types.join(", ")}\n` +
+                `Example: chore: scaffold foundation\n` +
+                `Got: "${title}"`
+              );
+            } else {
+              core.info(`PR title OK: "${title}"`);
+            }

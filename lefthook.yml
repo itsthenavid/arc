@@ -1,0 +1,7 @@
+pre-commit:
+  parallel: true
+  commands:
+    fmt:
+      run: bash tools/scripts/fmt.sh
+    lint:
+      run: bash tools/scripts/lint.sh

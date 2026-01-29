@@ -1,0 +1,11 @@
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/server/go"
+    schedule: { interval: "weekly" }
+  - package-ecosystem: "pub"
+    directory: "/client/flutter"
+    schedule: { interval: "weekly" }
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule: { interval: "weekly" }

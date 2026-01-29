@@ -1,0 +1,45 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+
+# Env (never commit secrets)
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Go
+bin/
+dist/
+*.exe
+*.out
+*.test
+coverage/
+**/tmp/
+
+# Flutter / Dart
+**/.dart_tool/
+**/.packages
+**/.pub-cache/
+**/build/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/.metadata
+
+# Node / tools (if ever used)
+node_modules/
+
+# VS Code (commit curated config only)
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# Codebase absolute dump
+dump-project.sh
+arc-project-dump.txt

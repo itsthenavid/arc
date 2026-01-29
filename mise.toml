@@ -1,0 +1,10 @@
+[tools]
+go = "1.22.6"
+node = "22.11.0"
+pnpm = "9.12.3"
+
+[tasks.doctor]
+run = "bash tools/scripts/doctor.sh"
+
+[tasks.ci]
+run = "bash tools/scripts/ci-local.sh"
