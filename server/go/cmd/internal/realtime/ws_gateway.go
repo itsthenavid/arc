@@ -2,8 +2,6 @@ package realtime
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +9,9 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,75 +24,163 @@ import (
 const (
 	wsSubprotocolV1 = "arc.realtime.v1"
 
-	// PR-001 dev defaults.
-	defaultSendQueueSize       = 128
-	defaultWriteTimeout        = 5 * time.Second
-	defaultCloseTimeout        = 1 * time.Second
-	maxConsecutivePingFailures = 3
+	wsDefaultSendQueueSize = 256
+	wsMinSendQueueSize     = 32
 
-	// Backpressure policy (PR-001): fail fast on saturated send queue.
+	wsDefaultWriteTimeout = 5 * time.Second
+	wsDefaultReadIdle     = 2 * time.Minute
+	wsCloseGrace          = 1 * time.Second
+
+	wsDefaultHistoryLimit = 50
+	wsMaxHistoryLimit     = 200
+
+	wsMaxPingFailures = 3
+
+	// Security defaults:
+	// - Origin is required by default.
+	// - Only localhost is allowed by default (secure-by-default for dev).
+	wsDefaultOriginRequired = true
+	wsDefaultAllowedOrigins = "http://localhost,http://127.0.0.1"
 )
 
-// WSGateway terminates websocket connections and bridges them into Hub conversations.
-// PR-001 scope: dev-only transport skeleton + basic rate limiting + message fanout.
+// WSGateway is the WebSocket entrypoint for Arc realtime.
+//
+// It enforces origin policy, subprotocol selection, rate limits, heartbeats,
+// and routes validated envelopes to the Hub and MessageStore.
 type WSGateway struct {
-	log *slog.Logger
-	hub *Hub
+	log   *slog.Logger
+	hub   *Hub
+	store MessageStore
+
+	devInsecure    bool
+	originRequired bool
+	allowedOrigins []string
+
+	// Derived for websocket.Accept origin checks.
+	// Accept() authorizes same-host origins by default, but for cross-origin it requires OriginPatterns.
+	originPatterns []string
+
+	writeTimeout    time.Duration
+	readIdleTimeout time.Duration
+	sendQueueSize   int
+
+	heartbeatEvery   time.Duration
+	heartbeatTimeout time.Duration
+
+	rateEvents int
+	rateWindow time.Duration
 }
 
-func NewWSGateway(log *slog.Logger, hub *Hub) *WSGateway {
-	return &WSGateway{log: log, hub: hub}
+// NewWSGateway constructs a gateway with secure defaults.
+// When hub/store are nil, it falls back to in-memory implementations for dev.
+func NewWSGateway(log *slog.Logger, hub *Hub, store MessageStore) *WSGateway {
+	if log == nil {
+		log = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	}
+	if hub == nil {
+		hub = NewHub(log)
+	}
+	if store == nil {
+		store = NewInMemoryStore()
+	}
+
+	g := &WSGateway{log: log, hub: hub, store: store}
+
+	// NOTE: InsecureSkipVerify is a dev-only knob (TLS verification). It is not an origin policy.
+	g.devInsecure = envBoolWS("ARC_WS_DEV_INSECURE", false)
+
+	g.originRequired = envBoolWS("ARC_WS_ORIGIN_REQUIRED", wsDefaultOriginRequired)
+	g.allowedOrigins = envCSVWS("ARC_WS_ALLOWED_ORIGINS", wsDefaultAllowedOrigins)
+
+	// IMPORTANT:
+	// websocket.Accept enforces its own origin policy:
+	// - same-host is ok
+	// - cross-origin requires OriginPatterns (host patterns)
+	// We derive these patterns from allowed origins so the two layers agree.
+	g.originPatterns = deriveOriginPatternsFromAllowedOrigins(g.allowedOrigins)
+
+	g.writeTimeout = envDurationWS("ARC_WS_WRITE_TIMEOUT", wsDefaultWriteTimeout)
+	g.readIdleTimeout = envDurationWS("ARC_WS_READ_IDLE_TIMEOUT", wsDefaultReadIdle)
+
+	g.sendQueueSize = envIntWS("ARC_WS_SEND_QUEUE", wsDefaultSendQueueSize)
+	if g.sendQueueSize < wsMinSendQueueSize {
+		g.sendQueueSize = wsMinSendQueueSize
+	}
+
+	g.heartbeatEvery = envDurationWS("ARC_WS_HEARTBEAT_INTERVAL", heartbeatInterval)
+	g.heartbeatTimeout = envDurationWS("ARC_WS_HEARTBEAT_TIMEOUT", heartbeatTimeout)
+
+	g.rateEvents = envIntWS("ARC_WS_RATE_EVENTS", rateLimitEvents)
+	g.rateWindow = envDurationWS("ARC_WS_RATE_WINDOW", rateLimitWindow)
+
+	return g
 }
 
+// ServeHTTP adapter so it can be mounted as http.Handler.
+func (g *WSGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	g.HandleWS(w, r)
+}
+
+// HandleWS upgrades an HTTP request to a WebSocket session and runs the realtime loop.
 func (g *WSGateway) HandleWS(w http.ResponseWriter, r *http.Request) {
-	// NOTE: PR-001 is dev-only. Proper origin checks + auth will be introduced in later PRs.
-	// We still enforce subprotocol to ensure client speaks the expected contract version.
+	if err := g.enforceOrigin(r); err != nil {
+		g.log.Info("ws.reject.origin", "err", err, "origin", r.Header.Get("Origin"), "remote", r.RemoteAddr)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		Subprotocols:       []string{wsSubprotocolV1},
-		InsecureSkipVerify: true, // PR-001 dev-only
+		Subprotocols: []string{wsSubprotocolV1},
+
+		// Fix for 403 "Origin ... is not authorized for Host ...":
+		// Authorize allowed origin hosts (e.g. localhost) for cross-origin requests.
+		OriginPatterns: g.originPatterns,
+
+		// Dev-only escape hatch.
+		InsecureSkipVerify: g.devInsecure,
 	})
 	if err != nil {
 		g.log.Error("ws.accept.fail", "err", err)
 		return
 	}
-
-	// Safety net. Primary shutdown happens via shutdown().
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "bye") }()
 
-	// Protect memory: refuse oversized frames early.
+	if sp := conn.Subprotocol(); sp != wsSubprotocolV1 {
+		g.log.Info("ws.reject.subprotocol", "got", sp, "want", wsSubprotocolV1)
+		_ = conn.Close(websocket.StatusProtocolError, "subprotocol required")
+		return
+	}
+
 	conn.SetReadLimit(maxFrameBytes)
 
-	sessionID := newRandomHex(10)
-	client := &Client{
-		SessionID: sessionID,
-		Send:      make(chan v1.Envelope, defaultSendQueueSize),
-	}
+	sessionID := NewRandomHex(10)
+	client := NewClient(sessionID, g.sendQueueSize)
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
 	var (
-		joined  *Conversation
-		closeMu sync.Once
+		closeOnce sync.Once
+		joined    *Conversation
 	)
 
-	shutdown := func(status websocket.StatusCode, reason string) {
-		closeMu.Do(func() {
-			// Best-effort bounded close handshake.
-			// websocket.Conn.Close is not context-aware; we bound our own shutdown sequence.
-			_ = conn.Close(status, reason)
+	// shutdown is idempotent. It does NOT close client.Send.
+	// Broadcast safety: client.Send remains open and membership removal happens before client.Close.
+	shutdown := func(code websocket.StatusCode, reason string) {
+		closeOnce.Do(func() {
+			if joined != nil {
+				joined.Leave(sessionID)
+				joined = nil
+			}
 
-			// Ensure goroutines stop.
+			client.Close()
+			_ = conn.Close(code, reason)
 			cancel()
-
-			// Closing send queue lets writer exit quickly.
-			close(client.Send)
 		})
 	}
 
-	limiter := &RateLimiter{}
+	rl := NewRateLimiter(g.rateEvents, g.rateWindow)
 
-	// Writer: drains client.Send and writes to the websocket.
 	writerDone := make(chan struct{})
 	go func() {
 		defer close(writerDone)
@@ -100,19 +189,11 @@ func (g *WSGateway) HandleWS(w http.ResponseWriter, r *http.Request) {
 			select {
 			case <-ctx.Done():
 				return
-
-			case env, ok := <-client.Send:
-				if !ok {
-					return
-				}
-
-				if err := writeEnvelope(ctx, conn, env, defaultWriteTimeout); err != nil {
-					g.log.Info(
-						"ws.write.fail",
-						"session_id", sessionID,
-						"close_status", websocket.CloseStatus(err),
-						"err", err,
-					)
+			case <-client.Done():
+				return
+			case env := <-client.Send:
+				if err := writeEnvelope(ctx, conn, env, g.writeTimeout); err != nil {
+					g.log.Info("ws.write.fail", "session_id", sessionID, "close_status", websocket.CloseStatus(err), "err", err)
 					shutdown(websocket.StatusAbnormalClosure, "write failed")
 					return
 				}
@@ -120,12 +201,11 @@ func (g *WSGateway) HandleWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// Heartbeat: periodic ping to detect dead connections.
 	heartbeatDone := make(chan struct{})
 	go func() {
 		defer close(heartbeatDone)
 
-		t := time.NewTicker(heartbeatInterval)
+		t := time.NewTicker(g.heartbeatEvery)
 		defer t.Stop()
 
 		failures := 0
@@ -133,64 +213,47 @@ func (g *WSGateway) HandleWS(w http.ResponseWriter, r *http.Request) {
 			select {
 			case <-ctx.Done():
 				return
-
+			case <-client.Done():
+				return
 			case <-t.C:
-				hbCtx, hbCancel := context.WithTimeout(ctx, heartbeatTimeout)
+				hbCtx, hbCancel := context.WithTimeout(ctx, g.heartbeatTimeout)
 				err := conn.Ping(hbCtx)
 				hbCancel()
 
 				if err != nil {
 					failures++
-					g.log.Info(
-						"ws.ping.fail",
-						"session_id", sessionID,
-						"failures", failures,
-						"close_status", websocket.CloseStatus(err),
-						"err", err,
-					)
-					if failures >= maxConsecutivePingFailures {
+					g.log.Info("ws.ping.fail", "session_id", sessionID, "failures", failures, "err", err)
+					if failures >= wsMaxPingFailures {
 						shutdown(websocket.StatusGoingAway, "heartbeat failed")
 						return
 					}
 					continue
 				}
-
 				failures = 0
 			}
 		}
 	}()
 
-	// Read loop: reads websocket frames -> JSON -> v1.Envelope -> validation -> dispatch.
 readLoop:
 	for {
-		env, err := readEnvelope(ctx, conn)
+		readCtx, readCancel := context.WithTimeout(ctx, g.readIdleTimeout)
+		env, err := readEnvelope(readCtx, conn)
+		readCancel()
+
 		if err != nil {
-			switch classifyWSReadErr(err) {
+			switch classifyReadErr(err) {
 			case readErrClose:
-				g.log.Info(
-					"ws.read.close",
-					"session_id", sessionID,
-					"close_status", websocket.CloseStatus(err),
-				)
 				shutdown(websocket.StatusNormalClosure, "peer closed")
 				break readLoop
-
 			case readErrCtxDone:
-				g.log.Info("ws.read.ctx_done", "session_id", sessionID, "err", err)
 				shutdown(websocket.StatusNormalClosure, "context done")
 				break readLoop
-
 			case readErrConnClosed:
-				g.log.Info("ws.read.conn_closed", "session_id", sessionID, "err", err)
 				shutdown(websocket.StatusAbnormalClosure, "conn closed")
 				break readLoop
-
 			case readErrBadJSON:
-				// Dev policy: tolerate malformed/partial frames.
-				g.log.Info("ws.read.bad_json", "session_id", sessionID, "err", err)
-				_ = g.sendError(ctx, client, "bad_json", "invalid JSON frame")
+				g.trySendError(ctx, client, "bad_json", "invalid JSON")
 				continue readLoop
-
 			default:
 				g.log.Info("ws.read.fail", "session_id", sessionID, "err", err)
 				shutdown(websocket.StatusAbnormalClosure, "read failed")
@@ -199,21 +262,21 @@ readLoop:
 		}
 
 		now := time.Now().UTC()
-		if !limiter.Allow(now) {
-			_ = g.sendError(ctx, client, "rate_limited", "too many events")
+		if !rl.Allow(now) {
+			g.trySendError(ctx, client, "rate_limited", "too many events")
 			shutdown(websocket.StatusPolicyViolation, "rate limited")
 			break readLoop
 		}
 
 		if err := env.Validate(); err != nil {
-			_ = g.sendError(ctx, client, "bad_envelope", err.Error())
+			g.trySendError(ctx, client, "bad_envelope", err.Error())
 			continue readLoop
 		}
 
 		switch env.Type {
 		case v1.TypeHello:
 			if err := g.onHello(ctx, client, env); err != nil {
-				_ = g.sendError(ctx, client, "hello_failed", err.Error())
+				g.trySendError(ctx, client, "hello_failed", err.Error())
 				shutdown(websocket.StatusPolicyViolation, "hello failed")
 				break readLoop
 			}
@@ -221,75 +284,68 @@ readLoop:
 		case v1.TypeConversationJoin:
 			conv, err := g.onJoin(ctx, client, env)
 			if err != nil {
-				_ = g.sendError(ctx, client, "join_failed", err.Error())
+				g.trySendError(ctx, client, "join_failed", err.Error())
 				continue readLoop
+			}
+
+			// Ensure membership stability: leave old conversation before switching.
+			if joined != nil && joined.ID != conv.ID {
+				joined.Leave(sessionID)
 			}
 			joined = conv
 
 		case v1.TypeMessageSend:
 			if joined == nil {
-				_ = g.sendError(ctx, client, "not_joined", "join a conversation first")
+				g.trySendError(ctx, client, "not_joined", "join first")
 				continue readLoop
 			}
-			if err := g.onMessageSend(ctx, client, joined, env); err != nil {
-				_ = g.sendError(ctx, client, "send_failed", err.Error())
+			if err := g.onMessageSend(ctx, client, joined, env, now); err != nil {
+				g.trySendError(ctx, client, "send_failed", err.Error())
+				continue readLoop
+			}
+
+		case v1.TypeConversationHistoryFetch:
+			if joined == nil {
+				g.trySendError(ctx, client, "not_joined", "join first")
+				continue readLoop
+			}
+			if err := g.onHistoryFetch(ctx, client, joined, env); err != nil {
+				g.trySendError(ctx, client, "history_failed", err.Error())
 				continue readLoop
 			}
 
 		default:
-			_ = g.sendError(ctx, client, "unsupported", fmt.Sprintf("type not allowed in PR-001: %s", env.Type))
-			continue readLoop
-		}
-
-		if ctx.Err() != nil {
-			break readLoop
+			g.trySendError(ctx, client, "unsupported", fmt.Sprintf("unsupported type: %s", env.Type))
 		}
 	}
 
-	if joined != nil {
-		joined.Leave(sessionID)
-	}
-
-	// Ensure shutdown (idempotent).
 	shutdown(websocket.StatusNormalClosure, "bye")
-
 	<-writerDone
 
-	// Give the heartbeat loop a bounded grace period to exit.
 	select {
 	case <-heartbeatDone:
-	case <-time.After(defaultCloseTimeout):
+	case <-time.After(wsCloseGrace):
 	}
 }
 
-// ---- Event handlers ----
+// ---- handlers ----
 
 func (g *WSGateway) onHello(ctx context.Context, client *Client, env v1.Envelope) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
 	var p v1.HelloPayload
 	if err := json.Unmarshal(env.Payload, &p); err != nil {
 		return fmt.Errorf("invalid payload: %w", err)
 	}
 
 	ackPayload, _ := json.Marshal(v1.HelloAckPayload{SessionID: client.SessionID})
-	ack := newEnvelope(v1.TypeHelloAck, ackPayload)
+	ack := newEnvelope(v1.TypeHelloAck, ackPayload, time.Now().UTC())
 
-	if ok := g.enqueue(ctx, client, ack); !ok {
-		return errors.New("client backpressure: hello.ack not delivered")
+	if !g.enqueue(ctx, client, ack) {
+		return errors.New("backpressure: hello.ack")
 	}
-
-	g.log.Info("hello.ack", "session_id", client.SessionID)
 	return nil
 }
 
 func (g *WSGateway) onJoin(ctx context.Context, client *Client, env v1.Envelope) (*Conversation, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
 	var p v1.ConversationJoinPayload
 	if err := json.Unmarshal(env.Payload, &p); err != nil {
 		return nil, fmt.Errorf("invalid payload: %w", err)
@@ -307,21 +363,17 @@ func (g *WSGateway) onJoin(ctx context.Context, client *Client, env v1.Envelope)
 		ConversationID: conv.ID,
 		Kind:           conv.Kind,
 	})
-	echo := newEnvelope(v1.TypeConversationJoin, echoPayload)
+	echo := newEnvelope(v1.TypeConversationJoin, echoPayload, time.Now().UTC())
 
-	if ok := g.enqueue(ctx, client, echo); !ok {
-		return nil, errors.New("client backpressure: join echo not delivered")
+	if !g.enqueue(ctx, client, echo) {
+		conv.Leave(client.SessionID)
+		return nil, errors.New("backpressure: join echo")
 	}
 
-	g.log.Info("conversation.join", "session_id", client.SessionID, "conversation_id", conv.ID)
 	return conv, nil
 }
 
-func (g *WSGateway) onMessageSend(ctx context.Context, client *Client, conv *Conversation, env v1.Envelope) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
+func (g *WSGateway) onMessageSend(ctx context.Context, client *Client, conv *Conversation, env v1.Envelope, now time.Time) error {
 	var p v1.MessageSendPayload
 	if err := json.Unmarshal(env.Payload, &p); err != nil {
 		return fmt.Errorf("invalid payload: %w", err)
@@ -342,10 +394,18 @@ func (g *WSGateway) onMessageSend(ctx context.Context, client *Client, conv *Con
 		return fmt.Errorf("message too long: max=%d chars", maxMessageChars)
 	}
 
-	now := time.Now().UTC()
-	serverMsgID := newRandomHex(16)
+	res, err := g.store.AppendMessage(ctx, AppendMessageInput{
+		ConversationID: p.ConversationID,
+		ClientMsgID:    p.ClientMsgID,
+		SenderSession:  client.SessionID,
+		Text:           text,
+		Now:            now,
+	})
+	if err != nil {
+		return fmt.Errorf("store append: %w", err)
+	}
 
-	stored, duplicated := conv.SendMessage(client.SessionID, p.ClientMsgID, text, serverMsgID, now)
+	stored := res.Stored
 
 	ackPayload, _ := json.Marshal(v1.MessageAckPayload{
 		ConversationID: stored.ConversationID,
@@ -353,21 +413,13 @@ func (g *WSGateway) onMessageSend(ctx context.Context, client *Client, conv *Con
 		ServerMsgID:    stored.ServerMsgID,
 		Seq:            stored.Seq,
 	})
-	ack := newEnvelopeAt(v1.TypeMessageAck, ackPayload, now)
+	ack := newEnvelope(v1.TypeMessageAck, ackPayload, now)
 
-	// Always ACK, even for duplicates.
-	if ok := g.enqueue(ctx, client, ack); !ok {
-		return errors.New("client backpressure: ack not delivered")
+	if !g.enqueue(ctx, client, ack) {
+		return errors.New("backpressure: ack")
 	}
 
-	if duplicated {
-		g.log.Info(
-			"message.dup",
-			"conversation_id", conv.ID,
-			"session_id", client.SessionID,
-			"client_msg_id", p.ClientMsgID,
-			"seq", stored.Seq,
-		)
+	if res.Duplicated {
 		return nil
 	}
 
@@ -380,67 +432,109 @@ func (g *WSGateway) onMessageSend(ctx context.Context, client *Client, conv *Con
 		Text:           stored.Text,
 		ServerTS:       stored.ServerTS,
 	})
-	newEnv := newEnvelopeAt(v1.TypeMessageNew, newPayload, now)
+	newEnv := newEnvelope(v1.TypeMessageNew, newPayload, now)
 	conv.Broadcast(newEnv)
-
-	g.log.Info("message.new", "conversation_id", conv.ID, "session_id", client.SessionID, "seq", stored.Seq)
 	return nil
 }
 
-// ---- Sending helpers ----
+func (g *WSGateway) onHistoryFetch(ctx context.Context, client *Client, conv *Conversation, env v1.Envelope) error {
+	var p v1.ConversationHistoryFetchPayload
+	if err := json.Unmarshal(env.Payload, &p); err != nil {
+		return fmt.Errorf("invalid payload: %w", err)
+	}
 
-func (g *WSGateway) sendError(ctx context.Context, client *Client, code string, msg string) error {
-	p, _ := json.Marshal(v1.ErrorPayload{Code: code, Message: msg})
-	env := newEnvelope(v1.TypeError, p)
+	convID := strings.TrimSpace(p.ConversationID)
+	if convID == "" {
+		return errors.New("missing conversation_id")
+	}
+	if convID != conv.ID {
+		return errors.New("not a member of conversation_id")
+	}
 
-	if ok := g.enqueue(ctx, client, env); !ok {
-		return ctx.Err()
+	limit := p.Limit
+	if limit <= 0 {
+		limit = wsDefaultHistoryLimit
+	}
+	if limit > wsMaxHistoryLimit {
+		limit = wsMaxHistoryLimit
+	}
+
+	out, err := g.store.FetchHistory(ctx, FetchHistoryInput{
+		ConversationID: convID,
+		AfterSeq:       p.AfterSeq,
+		Limit:          limit,
+	})
+	if err != nil {
+		return err
+	}
+
+	msgs := make([]v1.MessageNewPayload, 0, len(out.Messages))
+	for _, m := range out.Messages {
+		msgs = append(msgs, v1.MessageNewPayload{
+			ConversationID: m.ConversationID,
+			ClientMsgID:    m.ClientMsgID,
+			ServerMsgID:    m.ServerMsgID,
+			Seq:            m.Seq,
+			Sender:         m.SenderSession,
+			Text:           m.Text,
+			ServerTS:       m.ServerTS,
+		})
+	}
+
+	chunkPayload, _ := json.Marshal(v1.ConversationHistoryChunkPayload{
+		ConversationID: convID,
+		Messages:       msgs,
+		HasMore:        out.HasMore,
+	})
+	chunk := newEnvelope(v1.TypeConversationHistoryChunk, chunkPayload, time.Now().UTC())
+
+	if !g.enqueue(ctx, client, chunk) {
+		return errors.New("backpressure: history chunk")
 	}
 	return nil
 }
 
+// ---- send helpers ----
+
+func (g *WSGateway) trySendError(ctx context.Context, client *Client, code, msg string) {
+	p, _ := json.Marshal(v1.ErrorPayload{Code: code, Message: msg})
+	env := newEnvelope(v1.TypeError, p, time.Now().UTC())
+	_ = g.enqueue(ctx, client, env)
+}
+
 func (g *WSGateway) enqueue(ctx context.Context, client *Client, env v1.Envelope) bool {
 	select {
-	case client.Send <- env:
-		return true
 	case <-ctx.Done():
 		return false
+	case <-client.Done():
+		return false
+	case client.Send <- env:
+		return true
 	default:
 		return false
 	}
 }
 
-// ---- Envelope helpers ----
+// ---- envelope IO ----
 
-func newEnvelope(typ string, payload json.RawMessage) v1.Envelope {
-	return newEnvelopeAt(typ, payload, time.Now().UTC())
-}
-
-func newEnvelopeAt(typ string, payload json.RawMessage, ts time.Time) v1.Envelope {
+func newEnvelope(typ string, payload json.RawMessage, ts time.Time) v1.Envelope {
 	return v1.Envelope{
 		V:       v1.Version,
 		Type:    typ,
-		ID:      newRandomHex(10),
+		ID:      NewRandomHex(10),
 		TS:      ts,
 		Payload: payload,
 	}
 }
 
-// ---- I/O helpers ----
-
-func readEnvelope(parent context.Context, conn *websocket.Conn) (v1.Envelope, error) {
-	// Read blocks until a complete message frame is received or ctx is done.
-	mt, data, err := conn.Read(parent)
+func readEnvelope(ctx context.Context, conn *websocket.Conn) (v1.Envelope, error) {
+	mt, data, err := conn.Read(ctx)
 	if err != nil {
 		return v1.Envelope{}, err
 	}
-
-	// Strictly accept JSON text/binary frames only.
-	// (Some clients may send JSON as binary; both are OK.)
 	if mt != websocket.MessageText && mt != websocket.MessageBinary {
 		return v1.Envelope{}, fmt.Errorf("unsupported message type: %v", mt)
 	}
-
 	var env v1.Envelope
 	if err := json.Unmarshal(data, &env); err != nil {
 		return v1.Envelope{}, err
@@ -448,20 +542,18 @@ func readEnvelope(parent context.Context, conn *websocket.Conn) (v1.Envelope, er
 	return env, nil
 }
 
-func writeEnvelope(parent context.Context, conn *websocket.Conn, env v1.Envelope, d time.Duration) error {
-	ctx, cancel := context.WithTimeout(parent, d)
+func writeEnvelope(parent context.Context, conn *websocket.Conn, env v1.Envelope, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	b, err := json.Marshal(env)
 	if err != nil {
 		return err
 	}
-
-	// JSON is text. Using MessageText improves compatibility and debuggability.
 	return conn.Write(ctx, websocket.MessageText, b)
 }
 
-// ---- Read error classification ----
+// ---- read error classification ----
 
 type readErrKind uint8
 
@@ -473,40 +565,181 @@ const (
 	readErrBadJSON
 )
 
-func classifyWSReadErr(err error) readErrKind {
-	// CloseStatus returns -1 when the error is not a close frame / close error.
+func classifyReadErr(err error) readErrKind {
 	if websocket.CloseStatus(err) != -1 {
 		return readErrClose
 	}
-
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return readErrCtxDone
 	}
-
 	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
 		return readErrConnClosed
 	}
 
+	// JSON decode errors are typically returned by json.Unmarshal, not conn.Read.
+	// This fallback exists for robustness when error strings are propagated.
 	s := err.Error()
-	if strings.Contains(s, "use of closed network connection") ||
-		strings.Contains(s, "broken pipe") {
-		return readErrConnClosed
-	}
-
-	// JSON parse failures (including truncated frames).
-	if strings.Contains(s, "unexpected end of JSON input") ||
-		strings.Contains(s, "invalid character") ||
-		strings.Contains(s, "failed to unmarshal JSON") {
+	if strings.Contains(s, "unexpected end of JSON input") || strings.Contains(s, "invalid character") {
 		return readErrBadJSON
 	}
-
 	return readErrUnknown
 }
 
-// ---- ID helpers (dev-only for PR-001) ----
+// ---- origin policy ----
 
-func newRandomHex(nBytes int) string {
-	b := make([]byte, nBytes)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+func (g *WSGateway) enforceOrigin(r *http.Request) error {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		if g.originRequired {
+			return errors.New("missing origin")
+		}
+		return nil
+	}
+
+	if len(g.allowedOrigins) == 0 {
+		return errors.New("origin not allowed (no allowlist)")
+	}
+
+	originHost := originHostOnly(origin)
+
+	for _, a := range g.allowedOrigins {
+		a = strings.TrimSpace(a)
+		if a == "" {
+			continue
+		}
+		if a == "*" {
+			// Strongly discouraged, but honored if explicitly configured.
+			return nil
+		}
+
+		// Full origin match (scheme + host + optional port).
+		if origin == a {
+			return nil
+		}
+
+		// Host match fallback (ignores port/scheme).
+		if originHost != "" && originHost == originHostOnly(a) {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("origin not allowed: %s", origin)
+}
+
+func originHostOnly(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+
+	// URL form.
+	if strings.Contains(s, "://") {
+		u, err := url.Parse(s)
+		if err != nil {
+			return ""
+		}
+		h := strings.TrimSpace(u.Host)
+		if h == "" {
+			return ""
+		}
+		if host, _, err := net.SplitHostPort(h); err == nil {
+			return strings.ToLower(host)
+		}
+		return strings.ToLower(h)
+	}
+
+	// host[:port] form.
+	if host, _, err := net.SplitHostPort(s); err == nil {
+		return strings.ToLower(host)
+	}
+	return strings.ToLower(s)
+}
+
+func deriveOriginPatternsFromAllowedOrigins(allowed []string) []string {
+	// websocket.Accept matches OriginPatterns against the origin host using filepath.Match patterns.
+	// We keep this strict: only hosts extracted from allowlist are accepted.
+	seen := make(map[string]struct{}, len(allowed))
+
+	for _, a := range allowed {
+		h := originHostOnly(a)
+		if h == "" || h == "*" {
+			continue
+		}
+		seen[h] = struct{}{}
+	}
+
+	out := make([]string, 0, len(seen))
+	for h := range seen {
+		out = append(out, h)
+	}
+
+	// Stable in-file sort (avoid importing sort just for this).
+	for i := 0; i < len(out); i++ {
+		for j := i + 1; j < len(out); j++ {
+			if out[j] < out[i] {
+				out[i], out[j] = out[j], out[i]
+			}
+		}
+	}
+
+	return out
+}
+
+// ---- env helpers ----
+
+func envBoolWS(key string, def bool) bool {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return def
+	}
+	return b
+}
+
+func envIntWS(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
+}
+
+func envDurationWS(key string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return def
+	}
+	return d
+}
+
+func envCSVWS(key string, def string) []string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		raw = def
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		s := strings.TrimSpace(p)
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
