@@ -15,10 +15,18 @@ echo "test: go (shared)"
   go test ./...
 )
 
-echo "test: flutter (client/flutter)"
-(
-  cd "$ROOT_DIR/client/flutter"
-  flutter test
-)
-
-echo "OK: tests"
+# Flutter tests are optional in environments where Flutter SDK is not installed.
+# The dedicated CI job "Flutter (test)" is responsible for guaranteeing Flutter tests run in CI.
+if command -v flutter >/dev/null 2>&1; then
+  if [[ -d "$ROOT_DIR/client/flutter" ]]; then
+    echo "test: flutter (client/flutter)"
+    (
+      cd "$ROOT_DIR/client/flutter"
+      flutter test
+    )
+  else
+    echo "SKIP: flutter (client/flutter) directory not found"
+  fi
+else
+  echo "SKIP: flutter (client/flutter) - flutter binary not installed"
+fi
