@@ -5,12 +5,14 @@ services:
     image: postgres:16-alpine
     container_name: arc-postgres
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-arc}
       POSTGRES_USER: ${POSTGRES_USER:-arc}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-arc_dev_password}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
     volumes:
       - arc_postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -23,9 +25,11 @@ services:
     image: redis:7-alpine
     container_name: arc-redis
     restart: unless-stopped
+    env_file:
+      - .env
     command: ["redis-server", "--appendonly", "yes"]
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     volumes:
       - arc_redis_data:/data
     healthcheck:
@@ -37,6 +41,7 @@ services:
   dev:
     image: mcr.microsoft.com/devcontainers/base:ubuntu-24.04
     container_name: arc-dev
+    working_dir: /workspaces/arc
     volumes:
       - ./:/workspaces/arc:cached
     command: sleep infinity
