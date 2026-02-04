@@ -29,6 +29,9 @@ coverage/
 **/.flutter-plugins
 **/.flutter-plugins-dependencies
 **/.metadata
+client/flutter/build/
+*.iml
+local.properties
 
 # Node / tools (if ever used)
 node_modules/
@@ -43,3 +46,6 @@ node_modules/
 # Codebase absolute dump
 dump-project.sh
 arc-project-dump.txt
+
+# Local tool states
+tools/.state/
