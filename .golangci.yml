@@ -1,0 +1,74 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  allow-parallel-runners: true
+
+output:
+  sort-results: true
+  formats:
+    colored-line-number: {}
+
+linters:
+  default: none
+  enable:
+    # correctness / bugs
+    - govet
+    - errcheck
+    - staticcheck
+    - ineffassign
+    - unused
+
+    # security
+    - gosec
+
+    # maintainability
+    - revive
+    - gocritic
+    - misspell
+    - unparam
+    - bodyclose
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+    check-blank: true
+
+  govet:
+    enable-all: true
+    disable:
+      - fieldalignment # noisy; enable later if desired
+
+  gosec:
+    severity: medium
+    confidence: medium
+
+  revive:
+    ignore-generated-header: true
+    rules:
+      - name: blank-imports
+      - name: context-as-argument
+      - name: error-return
+      - name: error-strings
+      - name: if-return
+      - name: increment-decrement
+      - name: range
+      - name: receiver-naming
+      - name: var-declaration
+      - name: var-naming
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+  exclude-rules:
+    - path: ".*\\.gen\\.go"
+      linters: [revive, gocritic, gosec, errcheck]
+    - path: ".*_test\\.go"
+      linters: [gosec]

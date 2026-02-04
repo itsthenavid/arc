@@ -1,14 +1,13 @@
-// Package main provides a CI-friendly websocket smoke test for PR-001.
-// It connects TWO clients and asserts:
-//   - hello -> hello.ack
-//   - conversation.join echo
-//   - message.send -> message.ack + message.new broadcast
-//   - dedupe: second send with same client_msg_id yields ack but no second message.new
+// Package main provides a CI-friendly WebSocket smoke test for Arc realtime.
 //
-// Design notes:
-//   - The server uses Ping() and expects the peer to process control frames.
-//     Therefore, each smoke client runs a dedicated read loop to keep the connection healthy.
-//   - This is a smoke test, not a fuzz test. Fail fast on unexpected conditions.
+// It validates:
+//   - handshake + subprotocol selection
+//   - hello/ack session establishment
+//   - join echo
+//   - send -> ack
+//   - fanout message_new to another client
+//   - history fetch
+//   - idempotent dedupe by client_msg_id
 package main
 
 import (
@@ -17,6 +16,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -27,25 +27,28 @@ import (
 	"github.com/coder/websocket"
 )
 
+const (
+	defaultSubprotocol = "arc.realtime.v1"
+	maxReadBytes       = 1 << 20 // 1MiB
+)
+
 type smokeClient struct {
 	name      string
 	conn      *websocket.Conn
 	sessionID string
 
-	// inbox carries validated envelopes. It is bounded to avoid test deadlocks.
 	inbox chan v1.Envelope
-
-	// errCh receives the first terminal read-loop error (best-effort).
 	errCh chan error
 }
 
 func main() {
 	var (
-		wsURL   = flag.String("url", "ws://localhost:8080/ws", "WebSocket URL")
+		wsURL   = flag.String("url", "ws://127.0.0.1:8080/ws", "WebSocket URL")
+		origin  = flag.String("origin", "http://localhost", "Origin header to send (browser-like WS handshake)")
 		convID  = flag.String("conv", "dev-room-1", "Conversation ID to join")
 		kind    = flag.String("kind", "direct", "Conversation kind (echoed by server)")
 		text    = flag.String("text", "hello arc 👋", "Message text to send")
-		timeout = flag.Duration("timeout", 5*time.Second, "Per-step timeout")
+		timeout = flag.Duration("timeout", 7*time.Second, "Per-step timeout")
 		verbose = flag.Bool("v", false, "Verbose output")
 	)
 	flag.Parse()
@@ -53,64 +56,45 @@ func main() {
 	if err := validateWSURL(*wsURL); err != nil {
 		fatalf("invalid -url: %v", err)
 	}
-
-	rootCtx := context.Background()
-
-	a, err := connect(rootCtx, "A", *wsURL, *timeout)
-	if err != nil {
-		fatalf("connect A: %v", err)
+	if err := validateOrigin(*origin); err != nil {
+		fatalf("invalid -origin: %v", err)
 	}
+
+	root := context.Background()
+
+	a := mustConnect(root, "A", *wsURL, *origin, *timeout)
 	defer closeWS(a.conn)
 
-	b, err := connect(rootCtx, "B", *wsURL, *timeout)
-	if err != nil {
-		fatalf("connect B: %v", err)
-	}
+	b := mustConnect(root, "B", *wsURL, *origin, *timeout)
 	defer closeWS(b.conn)
 
 	if *verbose {
-		fmt.Printf("connected: A=%s B=%s\n", a.sessionID, b.sessionID)
+		fmt.Printf("connected: A=%s B=%s origin=%q\n", a.sessionID, b.sessionID, *origin)
 	}
 
-	if err := join(rootCtx, a, *convID, *kind, *timeout); err != nil {
-		fatalf("join A: %v", err)
-	}
-	if err := join(rootCtx, b, *convID, *kind, *timeout); err != nil {
-		fatalf("join B: %v", err)
-	}
+	mustJoin(root, a, *convID, *kind, *timeout)
+	mustJoin(root, b, *convID, *kind, *timeout)
 
 	clientMsgID := fmt.Sprintf("cmsg-%d", time.Now().UnixNano())
 
-	// First send from A.
-	serverMsgID, seq, err := sendAndAssertAck(rootCtx, a, *convID, clientMsgID, *text, *timeout)
-	if err != nil {
-		fatalf("send/ack: %v", err)
-	}
+	serverMsgID, seq := mustSendAndAssertAck(root, a, *convID, clientMsgID, *text, *timeout)
 
-	// Broadcast: assert B receives message.new.
-	if err := assertNew(rootCtx, b, *convID, clientMsgID, serverMsgID, seq, a.sessionID, *text, *timeout); err != nil {
-		fatalf("broadcast assert (B): %v", err)
-	}
+	mustAssertNew(root, b, *convID, clientMsgID, serverMsgID, seq, a.sessionID, *text, *timeout)
 
-	// Sender may also receive message.new; drain it if present to keep inbox clean.
-	_ = drainOptionalNew(rootCtx, a, *convID, clientMsgID, serverMsgID, seq, a.sessionID, *text, 750*time.Millisecond)
+	_ = drainOptionalNew(root, a, 750*time.Millisecond)
 
-	// Dedupe: send same client_msg_id again (A should receive ack, but no new broadcast).
-	_, seq2, err := sendAndAssertAck(rootCtx, a, *convID, clientMsgID, *text, *timeout)
-	if err != nil {
-		fatalf("dedupe send/ack: %v", err)
-	}
+	mustHistoryFetchContains(root, b, *convID, nil, 50, clientMsgID, serverMsgID, seq, a.sessionID, *text, *timeout)
+
+	after := seq
+	mustHistoryFetchEmpty(root, b, *convID, &after, 50, *timeout)
+
+	_, seq2 := mustSendAndAssertAck(root, a, *convID, clientMsgID, *text, *timeout)
 	if seq2 != seq {
 		fatalf("dedupe: seq mismatch: first=%d second=%d", seq, seq2)
 	}
 
-	// Dedupe assert: no second message.new should arrive on B (or A).
-	if err := assertNoType(rootCtx, b, v1.TypeMessageNew, 1200*time.Millisecond); err != nil {
-		fatalf("dedupe: expected no second message.new on B: %v", err)
-	}
-	if err := assertNoType(rootCtx, a, v1.TypeMessageNew, 1200*time.Millisecond); err != nil {
-		fatalf("dedupe: expected no second message.new on A: %v", err)
-	}
+	mustAssertNoType(root, b, v1.TypeMessageNew, 1200*time.Millisecond)
+	mustAssertNoType(root, a, v1.TypeMessageNew, 1200*time.Millisecond)
 
 	fmt.Printf("OK: A=%s B=%s conv_id=%s seq=%d server_msg_id=%s\n", a.sessionID, b.sessionID, *convID, seq, serverMsgID)
 }
@@ -123,33 +107,61 @@ func validateWSURL(raw string) error {
 	if u.Scheme != "ws" && u.Scheme != "wss" {
 		return fmt.Errorf("unsupported scheme: %s", u.Scheme)
 	}
-	if u.Host == "" {
+	if strings.TrimSpace(u.Host) == "" {
 		return errors.New("missing host")
 	}
-	if u.Path == "" {
+	if strings.TrimSpace(u.Path) == "" {
 		return errors.New("missing path")
 	}
 	return nil
 }
 
-func connect(parent context.Context, name, wsURL string, stepTimeout time.Duration) (*smokeClient, error) {
+func validateOrigin(raw string) error {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return err
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("origin must be http/https, got: %s", u.Scheme)
+	}
+	if strings.TrimSpace(u.Host) == "" {
+		return errors.New("origin missing host")
+	}
+	return nil
+}
+
+func mustConnect(parent context.Context, name, wsURL, origin string, stepTimeout time.Duration) *smokeClient {
 	ctx, cancel := context.WithTimeout(parent, stepTimeout)
 	defer cancel()
 
-	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
-		Subprotocols: []string{"arc.realtime.v1"},
-	})
-	if err != nil {
-		return nil, err
+	h := http.Header{}
+	if strings.TrimSpace(origin) != "" {
+		h.Set("Origin", origin)
 	}
 
-	// Keep memory bounded in case a server misbehaves.
-	conn.SetReadLimit(1 << 20)
+	conn, resp, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		Subprotocols: []string{defaultSubprotocol},
+		HTTPHeader:   h,
+	})
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+
+	if err != nil {
+		fatalf("connect %s: %v", name, err)
+	}
+
+	assertSubprotocol(resp, defaultSubprotocol)
+
+	conn.SetReadLimit(maxReadBytes)
 
 	c := &smokeClient{
 		name:  name,
 		conn:  conn,
-		inbox: make(chan v1.Envelope, 128),
+		inbox: make(chan v1.Envelope, 512),
 		errCh: make(chan error, 1),
 	}
 	c.startReadLoop()
@@ -161,29 +173,36 @@ func connect(parent context.Context, name, wsURL string, stepTimeout time.Durati
 		TS:      time.Now().UTC(),
 		Payload: mustJSON(v1.HelloPayload{}),
 	}
-	if err := writeWithTimeout(parent, conn, hello, stepTimeout); err != nil {
-		return nil, fmt.Errorf("write hello: %w", err)
-	}
+	mustWriteWithTimeout(parent, conn, hello, stepTimeout)
 
-	ack, err := c.readUntilType(parent, v1.TypeHelloAck, stepTimeout, nil)
-	if err != nil {
-		return nil, fmt.Errorf("read hello.ack: %w", err)
-	}
+	ack := c.mustReadUntilType(parent, v1.TypeHelloAck, stepTimeout, nil)
 
 	var p v1.HelloAckPayload
 	if err := json.Unmarshal(ack.Payload, &p); err != nil {
-		return nil, fmt.Errorf("unmarshal hello.ack payload: %w", err)
+		fatalf("unmarshal hello.ack payload (%s): %v", name, err)
 	}
 	if strings.TrimSpace(p.SessionID) == "" {
-		return nil, errors.New("hello.ack missing session_id")
+		fatalf("hello.ack missing session_id (%s)", name)
 	}
-
 	c.sessionID = p.SessionID
-	return c, nil
+
+	return c
+}
+
+func assertSubprotocol(resp *http.Response, want string) {
+	if resp == nil {
+		return
+	}
+	got := strings.TrimSpace(resp.Header.Get("Sec-WebSocket-Protocol"))
+	if got == "" {
+		return
+	}
+	if got != want {
+		fatalf("subprotocol mismatch: got=%q want=%q", got, want)
+	}
 }
 
 func (c *smokeClient) startReadLoop() {
-	// Background read loop: keeps draining frames so control frames are processed.
 	go func() {
 		defer close(c.inbox)
 
@@ -221,7 +240,6 @@ func (c *smokeClient) startReadLoop() {
 				return
 			}
 
-			// Deliver to inbox; if consumer is too slow, fail hard to avoid deadlock.
 			select {
 			case c.inbox <- env:
 			default:
@@ -235,7 +253,7 @@ func (c *smokeClient) startReadLoop() {
 	}()
 }
 
-func join(parent context.Context, c *smokeClient, convID, kind string, stepTimeout time.Duration) error {
+func mustJoin(parent context.Context, c *smokeClient, convID, kind string, stepTimeout time.Duration) {
 	env := v1.Envelope{
 		V:    v1.Version,
 		Type: v1.TypeConversationJoin,
@@ -246,29 +264,23 @@ func join(parent context.Context, c *smokeClient, convID, kind string, stepTimeo
 			Kind:           kind,
 		}),
 	}
-	if err := writeWithTimeout(parent, c.conn, env, stepTimeout); err != nil {
-		return fmt.Errorf("write join: %w", err)
-	}
+	mustWriteWithTimeout(parent, c.conn, env, stepTimeout)
 
-	echo, err := c.readUntilType(parent, v1.TypeConversationJoin, stepTimeout, nil)
-	if err != nil {
-		return fmt.Errorf("read join echo: %w", err)
-	}
+	echo := c.mustReadUntilType(parent, v1.TypeConversationJoin, stepTimeout, nil)
 
 	var p v1.ConversationJoinPayload
 	if err := json.Unmarshal(echo.Payload, &p); err != nil {
-		return fmt.Errorf("unmarshal join echo payload: %w", err)
+		fatalf("unmarshal join echo payload (%s): %v", c.name, err)
 	}
 	if p.ConversationID != convID {
-		return fmt.Errorf("join echo conv_id mismatch: got=%q want=%q", p.ConversationID, convID)
+		fatalf("join echo conv_id mismatch (%s): got=%q want=%q", c.name, p.ConversationID, convID)
 	}
 	if strings.TrimSpace(p.Kind) == "" {
-		return errors.New("join echo missing kind")
+		fatalf("join echo missing kind (%s)", c.name)
 	}
-	return nil
 }
 
-func sendAndAssertAck(parent context.Context, c *smokeClient, convID, clientMsgID, text string, stepTimeout time.Duration) (serverMsgID string, seq int64, err error) {
+func mustSendAndAssertAck(parent context.Context, c *smokeClient, convID, clientMsgID, text string, stepTimeout time.Duration) (serverMsgID string, seq int64) {
 	env := v1.Envelope{
 		V:    v1.Version,
 		Type: v1.TypeMessageSend,
@@ -280,77 +292,142 @@ func sendAndAssertAck(parent context.Context, c *smokeClient, convID, clientMsgI
 			Text:           text,
 		}),
 	}
-	if err := writeWithTimeout(parent, c.conn, env, stepTimeout); err != nil {
-		return "", 0, fmt.Errorf("write message.send: %w", err)
-	}
+	mustWriteWithTimeout(parent, c.conn, env, stepTimeout)
 
-	// Some servers may deliver message.new to sender; skip it while waiting for ack.
-	skip := map[string]struct{}{
-		v1.TypeMessageNew: {},
-	}
-	ack, err := c.readUntilType(parent, v1.TypeMessageAck, stepTimeout, skip)
-	if err != nil {
-		return "", 0, fmt.Errorf("read message.ack: %w", err)
-	}
+	skip := map[string]struct{}{v1.TypeMessageNew: {}}
+	ack := c.mustReadUntilType(parent, v1.TypeMessageAck, stepTimeout, skip)
 
 	var p v1.MessageAckPayload
 	if err := json.Unmarshal(ack.Payload, &p); err != nil {
-		return "", 0, fmt.Errorf("unmarshal message.ack payload: %w", err)
+		fatalf("unmarshal message.ack payload (%s): %v", c.name, err)
 	}
 	if p.ConversationID != convID {
-		return "", 0, fmt.Errorf("ack conv_id mismatch: got=%q want=%q", p.ConversationID, convID)
+		fatalf("ack conv_id mismatch (%s): got=%q want=%q", c.name, p.ConversationID, convID)
 	}
 	if p.ClientMsgID != clientMsgID {
-		return "", 0, fmt.Errorf("ack client_msg_id mismatch: got=%q want=%q", p.ClientMsgID, clientMsgID)
+		fatalf("ack client_msg_id mismatch (%s): got=%q want=%q", c.name, p.ClientMsgID, clientMsgID)
 	}
 	if strings.TrimSpace(p.ServerMsgID) == "" {
-		return "", 0, errors.New("ack missing server_msg_id")
+		fatalf("ack missing server_msg_id (%s)", c.name)
 	}
 	if p.Seq <= 0 {
-		return "", 0, fmt.Errorf("ack invalid seq: %d", p.Seq)
+		fatalf("ack invalid seq (%s): %d", c.name, p.Seq)
 	}
-
-	return p.ServerMsgID, p.Seq, nil
+	return p.ServerMsgID, p.Seq
 }
 
-func assertNew(parent context.Context, c *smokeClient, convID, clientMsgID, serverMsgID string, seq int64, senderSessionID, text string, stepTimeout time.Duration) error {
-	env, err := c.readUntilType(parent, v1.TypeMessageNew, stepTimeout, nil)
-	if err != nil {
-		return fmt.Errorf("read message.new: %w", err)
-	}
+func mustAssertNew(parent context.Context, c *smokeClient, convID, clientMsgID, serverMsgID string, seq int64, senderSessionID, text string, stepTimeout time.Duration) {
+	env := c.mustReadUntilType(parent, v1.TypeMessageNew, stepTimeout, nil)
 
 	var p v1.MessageNewPayload
 	if err := json.Unmarshal(env.Payload, &p); err != nil {
-		return fmt.Errorf("unmarshal message.new payload: %w", err)
+		fatalf("unmarshal message.new payload (%s): %v", c.name, err)
 	}
 
 	if p.ConversationID != convID {
-		return fmt.Errorf("new conv_id mismatch: got=%q want=%q", p.ConversationID, convID)
+		fatalf("new conv_id mismatch (%s): got=%q want=%q", c.name, p.ConversationID, convID)
 	}
 	if p.ClientMsgID != clientMsgID {
-		return fmt.Errorf("new client_msg_id mismatch: got=%q want=%q", p.ClientMsgID, clientMsgID)
+		fatalf("new client_msg_id mismatch (%s): got=%q want=%q", c.name, p.ClientMsgID, clientMsgID)
 	}
 	if p.ServerMsgID != serverMsgID {
-		return fmt.Errorf("new server_msg_id mismatch: got=%q want=%q", p.ServerMsgID, serverMsgID)
+		fatalf("new server_msg_id mismatch (%s): got=%q want=%q", c.name, p.ServerMsgID, serverMsgID)
 	}
 	if p.Seq != seq {
-		return fmt.Errorf("new seq mismatch: got=%d want=%d", p.Seq, seq)
+		fatalf("new seq mismatch (%s): got=%d want=%d", c.name, p.Seq, seq)
 	}
 	if p.Sender != senderSessionID {
-		return fmt.Errorf("new sender_session_id mismatch: got=%q want=%q", p.Sender, senderSessionID)
+		fatalf("new sender mismatch (%s): got=%q want=%q", c.name, p.Sender, senderSessionID)
 	}
 	if p.Text != text {
-		return fmt.Errorf("new text mismatch: got=%q want=%q", p.Text, text)
+		fatalf("new text mismatch (%s): got=%q want=%q", c.name, p.Text, text)
 	}
 	if p.ServerTS.IsZero() {
-		return errors.New("new server_ts missing/zero")
+		fatalf("new server_ts missing/zero (%s)", c.name)
 	}
-
-	return nil
 }
 
-// drainOptionalNew drains one message.new if it arrives within wait; otherwise OK.
-func drainOptionalNew(parent context.Context, c *smokeClient, convID, clientMsgID, serverMsgID string, seq int64, senderSessionID, text string, wait time.Duration) error {
+func mustHistoryFetchContains(
+	parent context.Context,
+	c *smokeClient,
+	convID string,
+	afterSeq *int64,
+	limit int,
+	clientMsgID, serverMsgID string,
+	seq int64,
+	senderSessionID, text string,
+	stepTimeout time.Duration,
+) {
+	req := v1.Envelope{
+		V:    v1.Version,
+		Type: v1.TypeConversationHistoryFetch,
+		ID:   fmt.Sprintf("%s-history-fetch", c.name),
+		TS:   time.Now().UTC(),
+		Payload: mustJSON(v1.ConversationHistoryFetchPayload{
+			ConversationID: convID,
+			AfterSeq:       afterSeq,
+			Limit:          limit,
+		}),
+	}
+	mustWriteWithTimeout(parent, c.conn, req, stepTimeout)
+
+	chunk := c.mustReadUntilType(parent, v1.TypeConversationHistoryChunk, stepTimeout, nil)
+
+	var p v1.ConversationHistoryChunkPayload
+	if err := json.Unmarshal(chunk.Payload, &p); err != nil {
+		fatalf("unmarshal history.chunk payload (%s): %v", c.name, err)
+	}
+	if p.ConversationID != convID {
+		fatalf("history.chunk conv_id mismatch (%s): got=%q want=%q", c.name, p.ConversationID, convID)
+	}
+
+	found := false
+	for _, m := range p.Messages {
+		if m.ConversationID == convID &&
+			m.ClientMsgID == clientMsgID &&
+			m.ServerMsgID == serverMsgID &&
+			m.Seq == seq &&
+			m.Sender == senderSessionID &&
+			m.Text == text &&
+			!m.ServerTS.IsZero() {
+			found = true
+			break
+		}
+	}
+	if !found {
+		fatalf("history.chunk missing expected message (%s)", c.name)
+	}
+}
+
+func mustHistoryFetchEmpty(parent context.Context, c *smokeClient, convID string, afterSeq *int64, limit int, stepTimeout time.Duration) {
+	req := v1.Envelope{
+		V:    v1.Version,
+		Type: v1.TypeConversationHistoryFetch,
+		ID:   fmt.Sprintf("%s-history-fetch-empty", c.name),
+		TS:   time.Now().UTC(),
+		Payload: mustJSON(v1.ConversationHistoryFetchPayload{
+			ConversationID: convID,
+			AfterSeq:       afterSeq,
+			Limit:          limit,
+		}),
+	}
+	mustWriteWithTimeout(parent, c.conn, req, stepTimeout)
+
+	chunk := c.mustReadUntilType(parent, v1.TypeConversationHistoryChunk, stepTimeout, nil)
+
+	var p v1.ConversationHistoryChunkPayload
+	if err := json.Unmarshal(chunk.Payload, &p); err != nil {
+		fatalf("unmarshal history.chunk payload (%s): %v", c.name, err)
+	}
+	if p.ConversationID != convID {
+		fatalf("history.chunk conv_id mismatch (%s): got=%q want=%q", c.name, p.ConversationID, convID)
+	}
+	if len(p.Messages) != 0 {
+		fatalf("expected empty history chunk (%s), got=%d", c.name, len(p.Messages))
+	}
+}
+
+func drainOptionalNew(parent context.Context, c *smokeClient, wait time.Duration) error {
 	ctx, cancel := context.WithTimeout(parent, wait)
 	defer cancel()
 
@@ -358,119 +435,97 @@ func drainOptionalNew(parent context.Context, c *smokeClient, convID, clientMsgI
 		select {
 		case <-ctx.Done():
 			return nil
-
 		case err := <-c.errCh:
 			if err != nil {
-				return fmt.Errorf("connection error while draining: %w", err)
+				return err
 			}
 			return errors.New("connection closed while draining")
-
 		case env, ok := <-c.inbox:
 			if !ok {
 				return errors.New("connection closed while draining")
 			}
 			if env.Type == v1.TypeMessageNew {
-				// Best-effort assert (optional).
-				var p v1.MessageNewPayload
-				if err := json.Unmarshal(env.Payload, &p); err != nil {
-					return fmt.Errorf("unmarshal drained message.new: %w", err)
-				}
-				if p.ConversationID != convID || p.ClientMsgID != clientMsgID || p.ServerMsgID != serverMsgID || p.Seq != seq || p.Sender != senderSessionID || p.Text != text {
-					return fmt.Errorf("drained message.new mismatch: %+v", p)
-				}
 				return nil
 			}
-			// Ignore other types while draining.
 		}
 	}
 }
 
-// assertNoType waits for duration and fails if it receives forbiddenType.
-func assertNoType(parent context.Context, c *smokeClient, forbiddenType string, wait time.Duration) error {
+func mustAssertNoType(parent context.Context, c *smokeClient, forbiddenType string, wait time.Duration) {
 	ctx, cancel := context.WithTimeout(parent, wait)
 	defer cancel()
 
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
-
+			return
 		case err := <-c.errCh:
 			if err == nil {
-				return errors.New("connection closed unexpectedly")
+				fatalf("connection closed unexpectedly (%s)", c.name)
 			}
-			// Connection closed is NOT OK here; it hides real protocol issues.
-			return fmt.Errorf("connection closed unexpectedly: %w", err)
-
+			fatalf("connection closed unexpectedly (%s): %v", c.name, err)
 		case env, ok := <-c.inbox:
 			if !ok {
-				return errors.New("connection closed unexpectedly")
+				fatalf("connection closed unexpectedly (%s)", c.name)
 			}
 			if env.Type == v1.TypeError {
 				var ep v1.ErrorPayload
 				_ = json.Unmarshal(env.Payload, &ep)
-				return fmt.Errorf("server error: code=%q msg=%q", ep.Code, ep.Message)
+				fatalf("server error (%s): code=%q msg=%q", c.name, ep.Code, ep.Message)
 			}
 			if env.Type == forbiddenType {
-				return fmt.Errorf("unexpected %s received", forbiddenType)
+				fatalf("unexpected %s received (%s)", forbiddenType, c.name)
 			}
-			// Ignore other messages and keep waiting.
 		}
 	}
 }
 
-// readUntilType reads from inbox until wantType or timeout.
-// skipTypes (optional) defines message types to ignore while waiting.
-func (c *smokeClient) readUntilType(parent context.Context, wantType string, stepTimeout time.Duration, skipTypes map[string]struct{}) (v1.Envelope, error) {
+func (c *smokeClient) mustReadUntilType(parent context.Context, wantType string, stepTimeout time.Duration, skipTypes map[string]struct{}) v1.Envelope {
 	ctx, cancel := context.WithTimeout(parent, stepTimeout)
 	defer cancel()
 
 	for {
 		select {
 		case <-ctx.Done():
-			return v1.Envelope{}, ctx.Err()
-
+			fatalf("timeout waiting for %q (%s): %v", wantType, c.name, ctx.Err())
 		case err := <-c.errCh:
 			if err == nil {
-				return v1.Envelope{}, errors.New("connection closed")
+				fatalf("connection closed while waiting for %q (%s)", wantType, c.name)
 			}
-			return v1.Envelope{}, err
-
+			fatalf("connection error while waiting for %q (%s): %v", wantType, c.name, err)
 		case env, ok := <-c.inbox:
 			if !ok {
-				return v1.Envelope{}, errors.New("connection closed")
+				fatalf("connection closed while waiting for %q (%s)", wantType, c.name)
 			}
-
 			if env.Type == wantType {
-				return env, nil
+				return env
 			}
-
 			if env.Type == v1.TypeError {
 				var ep v1.ErrorPayload
 				_ = json.Unmarshal(env.Payload, &ep)
-				return v1.Envelope{}, fmt.Errorf("server error: code=%q msg=%q", ep.Code, ep.Message)
+				fatalf("server error (%s): code=%q msg=%q", c.name, ep.Code, ep.Message)
 			}
-
 			if skipTypes != nil {
 				if _, ok := skipTypes[env.Type]; ok {
 					continue
 				}
 			}
-
-			return v1.Envelope{}, fmt.Errorf("unexpected envelope type: got=%q want=%q", env.Type, wantType)
+			fatalf("unexpected envelope type (%s): got=%q want=%q", c.name, env.Type, wantType)
 		}
 	}
 }
 
-func writeWithTimeout(parent context.Context, conn *websocket.Conn, env v1.Envelope, stepTimeout time.Duration) error {
+func mustWriteWithTimeout(parent context.Context, conn *websocket.Conn, env v1.Envelope, stepTimeout time.Duration) {
 	ctx, cancel := context.WithTimeout(parent, stepTimeout)
 	defer cancel()
 
 	b, err := json.Marshal(env)
 	if err != nil {
-		return err
+		fatalf("marshal envelope: %v", err)
 	}
-	return conn.Write(ctx, websocket.MessageText, b)
+	if err := conn.Write(ctx, websocket.MessageText, b); err != nil {
+		fatalf("write failed: %v", err)
+	}
 }
 
 func mustJSON(v any) json.RawMessage {
@@ -482,7 +537,6 @@ func mustJSON(v any) json.RawMessage {
 }
 
 func closeWS(conn *websocket.Conn) {
-	// Best-effort close; smoke test is short-lived.
 	_ = conn.Close(websocket.StatusNormalClosure, "bye")
 }
 

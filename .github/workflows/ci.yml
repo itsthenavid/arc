@@ -14,58 +14,81 @@ concurrency:
 
 jobs:
   go:
-    name: Go (format/lint/test)
+    name: Go (fmt/lint/test + postgres)
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: server/go
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: arc
+          POSTGRES_USER: arc
+          POSTGRES_PASSWORD: arc_dev_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U arc -d arc"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=30
+
+    env:
+      ARC_HTTP_ADDR: "127.0.0.1:8080"
+      ARC_DATABASE_URL: "postgres://arc:arc_dev_password@127.0.0.1:5432/arc?sslmode=disable"
 
     steps:
       - name: Checkout
-        # Pinned to commit SHA for v4.2.2 (recommended best practice)
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@v4
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
+          # Use server/go/go.mod for Go version to avoid drift.
           go-version-file: server/go/go.mod
           cache: true
 
-      - name: gofmt check
-        run: test -z "$(gofmt -l .)"
+      - name: Install Postgres client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
 
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v7
-        with:
-          version: v2.8.0
-          working-directory: server/go
-          args: --config .golangci.yml
+      - name: Wait for Postgres
+        run: |
+          for i in {1..60}; do
+            pg_isready -h 127.0.0.1 -p 5432 -U arc -d arc && exit 0
+            sleep 1
+          done
+          echo "Postgres did not become ready in time"
+          exit 1
 
-      - name: go test
-        run: go test ./...
+      - name: Apply DB schema
+        run: |
+          psql "$ARC_DATABASE_URL" -v ON_ERROR_STOP=1 -f infra/db/atlas/schema.sql
+
+      - name: Quality gates (fmt)
+        run: bash tools/scripts/fmt.sh
+
+      - name: Quality gates (lint)
+        run: bash tools/scripts/lint.sh
+
+      - name: Quality gates (test)
+        run: bash tools/scripts/test.sh
 
   flutter:
-    name: Flutter (analyze/test)
+    name: Flutter (test)
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: client/flutter
 
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@v4
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
+          flutter-version: "3.38.7"
           channel: "stable"
           cache: true
 
-      - name: flutter pub get
-        run: flutter pub get
-
-      - name: flutter analyze
-        run: flutter analyze
-
-      - name: flutter test
+      - name: Flutter tests
+        working-directory: client/flutter
         run: flutter test
