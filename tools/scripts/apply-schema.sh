@@ -11,7 +11,7 @@ export ARC_DATABASE_URL="${ARC_DATABASE_URL:-postgres://arc:arc_dev_password@127
 
 echo "apply-schema: url=${ARC_DATABASE_URL}"
 
-if ! command -v psql >/dev/null 2>&1; then
+if ! command -v psql > /dev/null 2>&1; then
   echo "apply-schema: psql is required (install postgresql client)"
   exit 1
 fi
