@@ -235,10 +235,13 @@ func (s *PostgresStore) CreateSession(ctx context.Context, in CreateSessionInput
 
 	sessions := pgIdent(s.schema, "sessions")
 
+	// English comment:
+	// Set last_used_at at creation time to reflect immediate usage (login),
+	// which simplifies auditing and analytics and matches rotation semantics.
 	_, err = s.pool.Exec(ctx,
 		`INSERT INTO `+sessions+` (
-		     id, user_id, refresh_token_hash, created_at, expires_at, platform, user_agent, ip
-		   ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		     id, user_id, refresh_token_hash, created_at, last_used_at, expires_at, platform, user_agent, ip
+		   ) VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8)`,
 		sessionID,
 		in.UserID,
 		hash,
@@ -266,11 +269,14 @@ func (s *PostgresStore) CreateSession(ctx context.Context, in CreateSessionInput
 		}
 	}
 
+	lu := now
+
 	out := Session{
 		ID:               sessionID,
 		UserID:           in.UserID,
 		RefreshTokenHash: hash,
 		CreatedAt:        now,
+		LastUsedAt:       &lu,
 		ExpiresAt:        expiresAt,
 		Platform:         platform,
 		UserAgent:        pgTrimPtr(in.UserAgent),
