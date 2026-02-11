@@ -17,7 +17,7 @@ echo "test: go (shared)"
 
 # Flutter tests are optional in environments where Flutter SDK is not installed.
 # The dedicated CI job "Flutter (test)" is responsible for guaranteeing Flutter tests run in CI.
-if command -v flutter >/dev/null 2>&1; then
+if command -v flutter > /dev/null 2>&1; then
   if [[ -d "$ROOT_DIR/client/flutter" ]]; then
     echo "test: flutter (client/flutter)"
     (

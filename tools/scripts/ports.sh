@@ -10,14 +10,14 @@ is_tcp_port_listening() {
   local port="$2"
 
   # macOS-friendly check: lsof returns 0 when a listener exists.
-  if command -v lsof >/dev/null 2>&1; then
-    lsof -nP -iTCP@"${host}":"${port}" -sTCP:LISTEN >/dev/null 2>&1
+  if command -v lsof > /dev/null 2>&1; then
+    lsof -nP -iTCP@"${host}":"${port}" -sTCP:LISTEN > /dev/null 2>&1
     return $?
   fi
 
   # Fallback: best-effort using nc if available.
-  if command -v nc >/dev/null 2>&1; then
-    nc -z "${host}" "${port}" >/dev/null 2>&1
+  if command -v nc > /dev/null 2>&1; then
+    nc -z "${host}" "${port}" > /dev/null 2>&1
     return $?
   fi
 
