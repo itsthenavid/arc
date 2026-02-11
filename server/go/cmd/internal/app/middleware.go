@@ -28,6 +28,7 @@ func WithRequestLogging(next http.Handler, log *slog.Logger) http.Handler {
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", lrw.status,
+			"bytes", lrw.bytes,
 			"duration_ms", time.Since(start).Milliseconds(),
 			"remote", r.RemoteAddr,
 			"user_agent", r.UserAgent(),

@@ -36,17 +36,14 @@ const (
 
 	wsMaxPingFailures = 3
 
-	// Security defaults:
-	// - Origin is required by default.
-	// - Only localhost is allowed by default (secure-by-default for dev).
+	// Secure-by-default for dev.
 	wsDefaultOriginRequired = true
 	wsDefaultAllowedOrigins = "http://localhost,http://127.0.0.1"
 )
 
-// WSGateway is the WebSocket entrypoint for Arc realtime.
-//
-// It enforces origin policy, subprotocol selection, rate limits, heartbeats,
-// and routes validated envelopes to the Hub and MessageStore.
+// WSGateway is Arc's realtime websocket gateway.
+// It enforces origin policy, subprotocol selection, heartbeats, rate limits,
+// and routes validated envelopes to Hub and MessageStore.
 type WSGateway struct {
 	log   *slog.Logger
 	hub   *Hub
@@ -55,10 +52,6 @@ type WSGateway struct {
 	devInsecure    bool
 	originRequired bool
 	allowedOrigins []string
-
-	// Derived for websocket.Accept origin checks.
-	// Accept() authorizes same-host origins by default, but for cross-origin it requires OriginPatterns.
-	originPatterns []string
 
 	writeTimeout    time.Duration
 	readIdleTimeout time.Duration
@@ -86,18 +79,11 @@ func NewWSGateway(log *slog.Logger, hub *Hub, store MessageStore) *WSGateway {
 
 	g := &WSGateway{log: log, hub: hub, store: store}
 
-	// NOTE: InsecureSkipVerify is a dev-only knob (TLS verification). It is not an origin policy.
+	// Dev-only escape hatch.
 	g.devInsecure = envBoolWS("ARC_WS_DEV_INSECURE", false)
 
 	g.originRequired = envBoolWS("ARC_WS_ORIGIN_REQUIRED", wsDefaultOriginRequired)
 	g.allowedOrigins = envCSVWS("ARC_WS_ALLOWED_ORIGINS", wsDefaultAllowedOrigins)
-
-	// IMPORTANT:
-	// websocket.Accept enforces its own origin policy:
-	// - same-host is ok
-	// - cross-origin requires OriginPatterns (host patterns)
-	// We derive these patterns from allowed origins so the two layers agree.
-	g.originPatterns = deriveOriginPatternsFromAllowedOrigins(g.allowedOrigins)
 
 	g.writeTimeout = envDurationWS("ARC_WS_WRITE_TIMEOUT", wsDefaultWriteTimeout)
 	g.readIdleTimeout = envDurationWS("ARC_WS_READ_IDLE_TIMEOUT", wsDefaultReadIdle)
@@ -116,12 +102,12 @@ func NewWSGateway(log *slog.Logger, hub *Hub, store MessageStore) *WSGateway {
 	return g
 }
 
-// ServeHTTP adapter so it can be mounted as http.Handler.
+// ServeHTTP allows mounting gateway directly as an http.Handler.
 func (g *WSGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	g.HandleWS(w, r)
 }
 
-// HandleWS upgrades an HTTP request to a WebSocket session and runs the realtime loop.
+// HandleWS upgrades the request to WebSocket and runs the realtime loop.
 func (g *WSGateway) HandleWS(w http.ResponseWriter, r *http.Request) {
 	if err := g.enforceOrigin(r); err != nil {
 		g.log.Info("ws.reject.origin", "err", err, "origin", r.Header.Get("Origin"), "remote", r.RemoteAddr)
@@ -129,14 +115,11 @@ func (g *WSGateway) HandleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// English comment:
+	// Origin enforcement is fully handled by enforceOrigin() as the single source of truth.
+	// We intentionally do NOT use AcceptOptions.OriginPatterns to avoid library-specific semantics mismatch.
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		Subprotocols: []string{wsSubprotocolV1},
-
-		// Fix for 403 "Origin ... is not authorized for Host ...":
-		// Authorize allowed origin hosts (e.g. localhost) for cross-origin requests.
-		OriginPatterns: g.originPatterns,
-
-		// Dev-only escape hatch.
+		Subprotocols:       []string{wsSubprotocolV1},
 		InsecureSkipVerify: g.devInsecure,
 	})
 	if err != nil {
@@ -153,7 +136,15 @@ func (g *WSGateway) HandleWS(w http.ResponseWriter, r *http.Request) {
 
 	conn.SetReadLimit(maxFrameBytes)
 
-	sessionID := NewRandomHex(10)
+	now := time.Now().UTC()
+	sessionID, err := NewSessionID(now)
+	if err != nil {
+		g.log.Error("ws.session_id.fail", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		_ = conn.Close(websocket.StatusInternalError, "internal error")
+		return
+	}
+
 	client := NewClient(sessionID, g.sendQueueSize)
 
 	ctx, cancel := context.WithCancel(r.Context())
@@ -165,14 +156,13 @@ func (g *WSGateway) HandleWS(w http.ResponseWriter, r *http.Request) {
 	)
 
 	// shutdown is idempotent. It does NOT close client.Send.
-	// Broadcast safety: client.Send remains open and membership removal happens before client.Close.
+	// Broadcast safety: membership removal happens before client.Close.
 	shutdown := func(code websocket.StatusCode, reason string) {
 		closeOnce.Do(func() {
 			if joined != nil {
 				joined.Leave(sessionID)
 				joined = nil
 			}
-
 			client.Close()
 			_ = conn.Close(code, reason)
 			cancel()
@@ -181,6 +171,7 @@ func (g *WSGateway) HandleWS(w http.ResponseWriter, r *http.Request) {
 
 	rl := NewRateLimiter(g.rateEvents, g.rateWindow)
 
+	// Writer loop
 	writerDone := make(chan struct{})
 	go func() {
 		defer close(writerDone)
@@ -193,7 +184,11 @@ func (g *WSGateway) HandleWS(w http.ResponseWriter, r *http.Request) {
 				return
 			case env := <-client.Send:
 				if err := writeEnvelope(ctx, conn, env, g.writeTimeout); err != nil {
-					g.log.Info("ws.write.fail", "session_id", sessionID, "close_status", websocket.CloseStatus(err), "err", err)
+					g.log.Info("ws.write.fail",
+						"session_id", sessionID,
+						"close_status", websocket.CloseStatus(err),
+						"err", err,
+					)
 					shutdown(websocket.StatusAbnormalClosure, "write failed")
 					return
 				}
@@ -201,6 +196,7 @@ func (g *WSGateway) HandleWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	// Heartbeat loop
 	heartbeatDone := make(chan struct{})
 	go func() {
 		defer close(heartbeatDone)
@@ -275,7 +271,7 @@ readLoop:
 
 		switch env.Type {
 		case v1.TypeHello:
-			if err := g.onHello(ctx, client, env); err != nil {
+			if err := g.onHello(ctx, client); err != nil {
 				g.trySendError(ctx, client, "hello_failed", err.Error())
 				shutdown(websocket.StatusPolicyViolation, "hello failed")
 				break readLoop
@@ -330,14 +326,9 @@ readLoop:
 
 // ---- handlers ----
 
-func (g *WSGateway) onHello(ctx context.Context, client *Client, env v1.Envelope) error {
-	var p v1.HelloPayload
-	if err := json.Unmarshal(env.Payload, &p); err != nil {
-		return fmt.Errorf("invalid payload: %w", err)
-	}
-
+func (g *WSGateway) onHello(ctx context.Context, client *Client) error {
 	ackPayload, _ := json.Marshal(v1.HelloAckPayload{SessionID: client.SessionID})
-	ack := newEnvelope(v1.TypeHelloAck, ackPayload, time.Now().UTC())
+	ack := mustNewEnvelope(v1.TypeHelloAck, ackPayload, time.Now().UTC())
 
 	if !g.enqueue(ctx, client, ack) {
 		return errors.New("backpressure: hello.ack")
@@ -363,7 +354,7 @@ func (g *WSGateway) onJoin(ctx context.Context, client *Client, env v1.Envelope)
 		ConversationID: conv.ID,
 		Kind:           conv.Kind,
 	})
-	echo := newEnvelope(v1.TypeConversationJoin, echoPayload, time.Now().UTC())
+	echo := mustNewEnvelope(v1.TypeConversationJoin, echoPayload, time.Now().UTC())
 
 	if !g.enqueue(ctx, client, echo) {
 		conv.Leave(client.SessionID)
@@ -413,7 +404,7 @@ func (g *WSGateway) onMessageSend(ctx context.Context, client *Client, conv *Con
 		ServerMsgID:    stored.ServerMsgID,
 		Seq:            stored.Seq,
 	})
-	ack := newEnvelope(v1.TypeMessageAck, ackPayload, now)
+	ack := mustNewEnvelope(v1.TypeMessageAck, ackPayload, now)
 
 	if !g.enqueue(ctx, client, ack) {
 		return errors.New("backpressure: ack")
@@ -432,7 +423,7 @@ func (g *WSGateway) onMessageSend(ctx context.Context, client *Client, conv *Con
 		Text:           stored.Text,
 		ServerTS:       stored.ServerTS,
 	})
-	newEnv := newEnvelope(v1.TypeMessageNew, newPayload, now)
+	newEnv := mustNewEnvelope(v1.TypeMessageNew, newPayload, now)
 	conv.Broadcast(newEnv)
 	return nil
 }
@@ -486,7 +477,7 @@ func (g *WSGateway) onHistoryFetch(ctx context.Context, client *Client, conv *Co
 		Messages:       msgs,
 		HasMore:        out.HasMore,
 	})
-	chunk := newEnvelope(v1.TypeConversationHistoryChunk, chunkPayload, time.Now().UTC())
+	chunk := mustNewEnvelope(v1.TypeConversationHistoryChunk, chunkPayload, time.Now().UTC())
 
 	if !g.enqueue(ctx, client, chunk) {
 		return errors.New("backpressure: history chunk")
@@ -498,7 +489,7 @@ func (g *WSGateway) onHistoryFetch(ctx context.Context, client *Client, conv *Co
 
 func (g *WSGateway) trySendError(ctx context.Context, client *Client, code, msg string) {
 	p, _ := json.Marshal(v1.ErrorPayload{Code: code, Message: msg})
-	env := newEnvelope(v1.TypeError, p, time.Now().UTC())
+	env := mustNewEnvelope(v1.TypeError, p, time.Now().UTC())
 	_ = g.enqueue(ctx, client, env)
 }
 
@@ -517,11 +508,16 @@ func (g *WSGateway) enqueue(ctx context.Context, client *Client, env v1.Envelope
 
 // ---- envelope IO ----
 
-func newEnvelope(typ string, payload json.RawMessage, ts time.Time) v1.Envelope {
+func mustNewEnvelope(typ string, payload json.RawMessage, ts time.Time) v1.Envelope {
+	id, err := NewEnvelopeID(ts)
+	if err != nil {
+		panic(fmt.Errorf("envelope id generation failed: %w", err))
+	}
+
 	return v1.Envelope{
 		V:       v1.Version,
 		Type:    typ,
-		ID:      NewRandomHex(10),
+		ID:      id,
 		TS:      ts,
 		Payload: payload,
 	}
@@ -576,8 +572,6 @@ func classifyReadErr(err error) readErrKind {
 		return readErrConnClosed
 	}
 
-	// JSON decode errors are typically returned by json.Unmarshal, not conn.Read.
-	// This fallback exists for robustness when error strings are propagated.
 	s := err.Error()
 	if strings.Contains(s, "unexpected end of JSON input") || strings.Contains(s, "invalid character") {
 		return readErrBadJSON
@@ -608,16 +602,11 @@ func (g *WSGateway) enforceOrigin(r *http.Request) error {
 			continue
 		}
 		if a == "*" {
-			// Strongly discouraged, but honored if explicitly configured.
 			return nil
 		}
-
-		// Full origin match (scheme + host + optional port).
 		if origin == a {
 			return nil
 		}
-
-		// Host match fallback (ignores port/scheme).
 		if originHost != "" && originHost == originHostOnly(a) {
 			return nil
 		}
@@ -632,7 +621,6 @@ func originHostOnly(s string) string {
 		return ""
 	}
 
-	// URL form.
 	if strings.Contains(s, "://") {
 		u, err := url.Parse(s)
 		if err != nil {
@@ -648,41 +636,10 @@ func originHostOnly(s string) string {
 		return strings.ToLower(h)
 	}
 
-	// host[:port] form.
 	if host, _, err := net.SplitHostPort(s); err == nil {
 		return strings.ToLower(host)
 	}
 	return strings.ToLower(s)
-}
-
-func deriveOriginPatternsFromAllowedOrigins(allowed []string) []string {
-	// websocket.Accept matches OriginPatterns against the origin host using filepath.Match patterns.
-	// We keep this strict: only hosts extracted from allowlist are accepted.
-	seen := make(map[string]struct{}, len(allowed))
-
-	for _, a := range allowed {
-		h := originHostOnly(a)
-		if h == "" || h == "*" {
-			continue
-		}
-		seen[h] = struct{}{}
-	}
-
-	out := make([]string, 0, len(seen))
-	for h := range seen {
-		out = append(out, h)
-	}
-
-	// Stable in-file sort (avoid importing sort just for this).
-	for i := 0; i < len(out); i++ {
-		for j := i + 1; j < len(out); j++ {
-			if out[j] < out[i] {
-				out[i], out[j] = out[j], out[i]
-			}
-		}
-	}
-
-	return out
 }
 
 // ---- env helpers ----
