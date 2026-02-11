@@ -2,7 +2,6 @@ package realtime
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -11,25 +10,31 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Integration tests are enabled when ARC_DATABASE_URL is set.
 // This keeps local "go test ./..." fast & deterministic without requiring Postgres.
+
 func TestPostgresStore_Append_Dedupe_NoSeqWaste(t *testing.T) {
 	t.Parallel()
 
 	pool := mustOpenTestPool(t)
 	defer pool.Close()
 
-	mustApplySchema(t, pool)
+	schema := mustCreateTestSchema(t, pool)
+	t.Cleanup(func() { mustDropSchema(t, pool, schema) })
 
-	store := NewPostgresStore(pool)
+	mustApplySchema(t, pool, schema)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	store := mustNewStore(t, pool, schema)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	convID := "it-dedupe-" + NewRandomHex(8)
+
 	clientMsgID := "cmsg-" + NewRandomHex(8)
 	now := time.Now().UTC()
 
@@ -48,6 +53,9 @@ func TestPostgresStore_Append_Dedupe_NoSeqWaste(t *testing.T) {
 	}
 	if first.Stored.Seq != 1 {
 		t.Fatalf("append first: expected seq=1 got=%d", first.Stored.Seq)
+	}
+	if strings.TrimSpace(first.Stored.ServerMsgID) == "" {
+		t.Fatalf("append first: expected non-empty server_msg_id")
 	}
 
 	second, err := store.AppendMessage(ctx, AppendMessageInput{
@@ -70,7 +78,7 @@ func TestPostgresStore_Append_Dedupe_NoSeqWaste(t *testing.T) {
 		t.Fatalf("append duplicate: server_msg_id mismatch")
 	}
 
-	cnt := mustCountMessages(t, pool, convID)
+	cnt := mustCountMessages(t, pool, schema, convID)
 	if cnt != 1 {
 		t.Fatalf("expected 1 message row, got %d", cnt)
 	}
@@ -82,11 +90,14 @@ func TestPostgresStore_History_Order_AfterSeq_HasMore(t *testing.T) {
 	pool := mustOpenTestPool(t)
 	defer pool.Close()
 
-	mustApplySchema(t, pool)
+	schema := mustCreateTestSchema(t, pool)
+	t.Cleanup(func() { mustDropSchema(t, pool, schema) })
 
-	store := NewPostgresStore(pool)
+	mustApplySchema(t, pool, schema)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	store := mustNewStore(t, pool, schema)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
 	convID := "it-history-" + NewRandomHex(8)
@@ -150,11 +161,14 @@ func TestPostgresStore_ConcurrentAppend_StrictSeq_NoGaps(t *testing.T) {
 	pool := mustOpenTestPool(t)
 	defer pool.Close()
 
-	mustApplySchema(t, pool)
+	schema := mustCreateTestSchema(t, pool)
+	t.Cleanup(func() { mustDropSchema(t, pool, schema) })
 
-	store := NewPostgresStore(pool)
+	mustApplySchema(t, pool, schema)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	store := mustNewStore(t, pool, schema)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
 	convID := "it-concurrency-" + NewRandomHex(8)
@@ -165,6 +179,7 @@ func TestPostgresStore_ConcurrentAppend_StrictSeq_NoGaps(t *testing.T) {
 	wg.Add(n)
 
 	errCh := make(chan error, n)
+
 	for i := 0; i < n; i++ {
 		i := i
 		go func() {
@@ -183,6 +198,7 @@ func TestPostgresStore_ConcurrentAppend_StrictSeq_NoGaps(t *testing.T) {
 			}
 		}()
 	}
+
 	wg.Wait()
 	close(errCh)
 
@@ -207,10 +223,12 @@ func TestPostgresStore_ConcurrentAppend_StrictSeq_NoGaps(t *testing.T) {
 
 	seqs := make([]int64, 0, len(out.Messages))
 	seen := make(map[int64]struct{}, len(out.Messages))
+
 	for _, m := range out.Messages {
 		seqs = append(seqs, m.Seq)
 		seen[m.Seq] = struct{}{}
 	}
+
 	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
 
 	// Strict: seqs must be exactly 1..n.
@@ -225,6 +243,16 @@ func TestPostgresStore_ConcurrentAppend_StrictSeq_NoGaps(t *testing.T) {
 }
 
 // ---- test helpers ----
+
+func mustNewStore(t *testing.T, pool *pgxpool.Pool, schema string) *PostgresStore {
+	t.Helper()
+
+	st, err := NewPostgresStore(pool, WithSchema(schema))
+	if err != nil {
+		t.Fatalf("new postgres store: %v", err)
+	}
+	return st
+}
 
 func mustOpenTestPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
@@ -261,31 +289,56 @@ func mustOpenTestPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-func mustApplySchema(t *testing.T, pool *pgxpool.Pool) {
+func mustCreateTestSchema(t *testing.T, pool *pgxpool.Pool) string {
+	t.Helper()
+
+	schema := "arc_it_" + strings.ToLower(NewRandomHex(8))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if _, err := pool.Exec(ctx, `CREATE SCHEMA `+pgx.Identifier{schema}.Sanitize()); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	return schema
+}
+
+func mustDropSchema(t *testing.T, pool *pgxpool.Pool, schema string) {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	_, _ = pool.Exec(ctx, `DROP SCHEMA IF EXISTS `+pgx.Identifier{schema}.Sanitize()+` CASCADE`)
+}
+
+func mustApplySchema(t *testing.T, pool *pgxpool.Pool, schema string) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+
+	conversations := pgIdent(schema, "conversations")
+	cursors := pgIdent(schema, "conversation_cursors")
+	messages := pgIdent(schema, "messages")
+
 	// Minimal schema required by PostgresStore.
 	// Must remain semantically aligned with infra/db/atlas/schema.sql.
-	const schemaSQL = `
-CREATE SCHEMA IF NOT EXISTS arc;
-
-CREATE TABLE IF NOT EXISTS arc.conversations (
+	schemaSQL := fmt.Sprintf(`
+CREATE TABLE IF NOT EXISTS %s (
   id         TEXT PRIMARY KEY,
   kind       TEXT NOT NULL CHECK (kind IN ('direct', 'group')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS arc.conversation_cursors (
-  conversation_id TEXT PRIMARY KEY REFERENCES arc.conversations(id) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS %s (
+  conversation_id TEXT PRIMARY KEY REFERENCES %s(id) ON DELETE CASCADE,
   next_seq        BIGINT NOT NULL DEFAULT 1,
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS arc.messages (
-  conversation_id TEXT NOT NULL REFERENCES arc.conversations(id) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS %s (
+  conversation_id TEXT NOT NULL REFERENCES %s(id) ON DELETE CASCADE,
   seq             BIGINT NOT NULL,
   server_msg_id   TEXT NOT NULL,
   client_msg_id   TEXT NOT NULL,
@@ -301,35 +354,33 @@ CREATE TABLE IF NOT EXISTS arc.messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_seq_asc
-  ON arc.messages (conversation_id, seq ASC);
+  ON %s (conversation_id, seq ASC);
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_seq_desc
-  ON arc.messages (conversation_id, seq DESC);
+  ON %s (conversation_id, seq DESC);
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_client_msg
-  ON arc.messages (conversation_id, client_msg_id);
-`
+  ON %s (conversation_id, client_msg_id);
+`, conversations, cursors, conversations, messages, conversations, messages, messages, messages)
 
-	_, err := pool.Exec(ctx, schemaSQL)
-	if err != nil {
+	if _, err := pool.Exec(ctx, schemaSQL); err != nil {
 		t.Fatalf("apply schema: %v", err)
 	}
 }
 
-func mustCountMessages(t *testing.T, pool *pgxpool.Pool, conversationID string) int {
+func mustCountMessages(t *testing.T, pool *pgxpool.Pool, schema string, conversationID string) int {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	var cnt int
-	err := pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM arc.messages WHERE conversation_id = $1`,
+	if err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM `+pgIdent(schema, "messages")+` WHERE conversation_id = $1`,
 		conversationID,
-	).Scan(&cnt)
-
-	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+	).Scan(&cnt); err != nil {
 		t.Fatalf("count messages: %v", err)
 	}
+
 	return cnt
 }

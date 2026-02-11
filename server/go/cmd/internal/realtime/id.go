@@ -1,21 +1,25 @@
 package realtime
 
 import (
-	"crypto/rand"
-	"encoding/hex"
-	"fmt"
+	"time"
+
+	"arc/cmd/identity/ids"
 )
 
-// NewRandomHex returns a cryptographically secure random hex string.
-// nBytes controls entropy; resulting length is nBytes*2 chars.
-func NewRandomHex(nBytes int) string {
-	if nBytes <= 0 {
-		nBytes = 8
-	}
-	b := make([]byte, nBytes)
-	if _, err := rand.Read(b); err != nil {
-		// This should basically never happen; if it does, crash loudly.
-		panic(fmt.Errorf("crypto/rand failed: %w", err))
-	}
-	return hex.EncodeToString(b)
+// NewSessionID returns a ULID used as websocket session id.
+// Must be 26 chars to satisfy DB constraints / FKs.
+func NewSessionID(now time.Time) (string, error) {
+	return ids.NewULID(now)
+}
+
+// NewEnvelopeID returns a ULID used as envelope id.
+// ULID is preferable to random hex for tracing and ordering in logs.
+func NewEnvelopeID(now time.Time) (string, error) {
+	return ids.NewULID(now)
+}
+
+// NewServerMsgID returns a ULID used as server_msg_id.
+// This keeps IDs uniform across the system.
+func NewServerMsgID(now time.Time) (string, error) {
+	return ids.NewULID(now)
 }

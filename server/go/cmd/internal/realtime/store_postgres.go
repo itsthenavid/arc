@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -22,12 +24,47 @@ import (
 //   - No sequence gaps caused by duplicates
 //   - Strict monotonic ordering under concurrency
 type PostgresStore struct {
-	pool *pgxpool.Pool
+	pool   *pgxpool.Pool
+	schema string
+}
+
+// PostgresOption configures PostgresStore behavior.
+type PostgresOption func(*PostgresStore) error
+
+// WithSchema sets the DB schema used by this store (default: "arc").
+// The schema name is validated and safely quoted in queries.
+func WithSchema(schema string) PostgresOption {
+	return func(s *PostgresStore) error {
+		schema = strings.TrimSpace(schema)
+		if schema == "" {
+			return errors.New("realtime: empty schema")
+		}
+		if !isValidPGIdent(schema) {
+			return errors.New("realtime: invalid schema identifier")
+		}
+		s.schema = schema
+		return nil
+	}
 }
 
 // NewPostgresStore constructs a Postgres-backed MessageStore.
-func NewPostgresStore(pool *pgxpool.Pool) *PostgresStore {
-	return &PostgresStore{pool: pool}
+func NewPostgresStore(pool *pgxpool.Pool, opts ...PostgresOption) (*PostgresStore, error) {
+	st := &PostgresStore{
+		pool:   pool,
+		schema: "arc",
+	}
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		if err := opt(st); err != nil {
+			return nil, err
+		}
+	}
+	if st.pool == nil {
+		return nil, errors.New("realtime: nil pool")
+	}
+	return st, nil
 }
 
 // Close is a no-op because the pool is owned by the caller.
@@ -35,8 +72,14 @@ func (s *PostgresStore) Close() error { return nil }
 
 // AppendMessage appends a message with idempotency and monotonic sequence allocation.
 func (s *PostgresStore) AppendMessage(ctx context.Context, in AppendMessageInput) (AppendMessageResult, error) {
+	if s == nil || s.pool == nil {
+		return AppendMessageResult{}, errors.New("realtime: nil store")
+	}
 	if in.ConversationID == "" || in.ClientMsgID == "" || in.SenderSession == "" {
 		return AppendMessageResult{}, errors.New("invalid input")
+	}
+	if err := ctx.Err(); err != nil {
+		return AppendMessageResult{}, err
 	}
 
 	now := in.Now
@@ -53,6 +96,10 @@ func (s *PostgresStore) AppendMessage(ctx context.Context, in AppendMessageInput
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	conversations := pgIdent(s.schema, "conversations")
+	cursors := pgIdent(s.schema, "conversation_cursors")
+	messages := pgIdent(s.schema, "messages")
+
 	// Serialize all writes per conversation to guarantee:
 	// - No seq waste for duplicates
 	// - Strict monotonic ordering without races
@@ -63,14 +110,14 @@ func (s *PostgresStore) AppendMessage(ctx context.Context, in AppendMessageInput
 	}
 
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO arc.conversations (id, kind) VALUES ($1, 'direct')
+		`INSERT INTO `+conversations+` (id, kind) VALUES ($1, 'direct')
 		 ON CONFLICT (id) DO NOTHING`,
 		in.ConversationID,
 	); err != nil {
 		return AppendMessageResult{}, err
 	}
 
-	existing, err := readMessageByClientMsgID(ctx, tx, in.ConversationID, in.ClientMsgID)
+	existing, err := readMessageByClientMsgID(ctx, tx, messages, in.ConversationID, in.ClientMsgID)
 	if err == nil {
 		if err := tx.Commit(ctx); err != nil {
 			return AppendMessageResult{}, err
@@ -83,7 +130,7 @@ func (s *PostgresStore) AppendMessage(ctx context.Context, in AppendMessageInput
 
 	// Cursor row ensures monotonic seq allocation.
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO arc.conversation_cursors (conversation_id, next_seq)
+		`INSERT INTO `+cursors+` (conversation_id, next_seq)
 		 VALUES ($1, 1)
 		 ON CONFLICT (conversation_id) DO NOTHING`,
 		in.ConversationID,
@@ -93,7 +140,7 @@ func (s *PostgresStore) AppendMessage(ctx context.Context, in AppendMessageInput
 
 	var seq int64
 	if err := tx.QueryRow(ctx,
-		`UPDATE arc.conversation_cursors
+		`UPDATE `+cursors+`
 		    SET next_seq = next_seq + 1,
 		        updated_at = now()
 		  WHERE conversation_id = $1
@@ -106,7 +153,7 @@ func (s *PostgresStore) AppendMessage(ctx context.Context, in AppendMessageInput
 	serverMsgID := NewRandomHex(16)
 
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO arc.messages (
+		`INSERT INTO `+messages+` (
 		     conversation_id, seq, server_msg_id, client_msg_id, sender_session, text, server_ts
 		   ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 		in.ConversationID, seq, serverMsgID, in.ClientMsgID, in.SenderSession, in.Text, now,
@@ -132,8 +179,14 @@ func (s *PostgresStore) AppendMessage(ctx context.Context, in AppendMessageInput
 
 // FetchHistory returns messages ordered by seq ASC, with optional paging by AfterSeq.
 func (s *PostgresStore) FetchHistory(ctx context.Context, in FetchHistoryInput) (FetchHistoryResult, error) {
+	if s == nil || s.pool == nil {
+		return FetchHistoryResult{}, errors.New("realtime: nil store")
+	}
 	if in.ConversationID == "" {
 		return FetchHistoryResult{}, errors.New("missing conversation_id")
+	}
+	if err := ctx.Err(); err != nil {
+		return FetchHistoryResult{}, err
 	}
 
 	limit := in.Limit
@@ -145,6 +198,8 @@ func (s *PostgresStore) FetchHistory(ctx context.Context, in FetchHistoryInput) 
 	}
 	fetch := limit + 1
 
+	messages := pgIdent(s.schema, "messages")
+
 	var (
 		rows pgx.Rows
 		err  error
@@ -153,7 +208,7 @@ func (s *PostgresStore) FetchHistory(ctx context.Context, in FetchHistoryInput) 
 	if in.AfterSeq == nil {
 		rows, err = s.pool.Query(ctx,
 			`SELECT conversation_id, client_msg_id, server_msg_id, seq, sender_session, text, server_ts
-			   FROM arc.messages
+			   FROM `+messages+`
 			  WHERE conversation_id = $1
 			  ORDER BY seq ASC
 			  LIMIT $2`,
@@ -162,7 +217,7 @@ func (s *PostgresStore) FetchHistory(ctx context.Context, in FetchHistoryInput) 
 	} else {
 		rows, err = s.pool.Query(ctx,
 			`SELECT conversation_id, client_msg_id, server_msg_id, seq, sender_session, text, server_ts
-			   FROM arc.messages
+			   FROM `+messages+`
 			  WHERE conversation_id = $1 AND seq > $2
 			  ORDER BY seq ASC
 			  LIMIT $3`,
@@ -202,13 +257,24 @@ func (s *PostgresStore) FetchHistory(ctx context.Context, in FetchHistoryInput) 
 	return FetchHistoryResult{Messages: msgs, HasMore: hasMore}, nil
 }
 
-func readMessageByClientMsgID(ctx context.Context, tx pgx.Tx, conversationID, clientMsgID string) (StoredMessage, error) {
+func readMessageByClientMsgID(ctx context.Context, tx pgx.Tx, messagesTable string, conversationID, clientMsgID string) (StoredMessage, error) {
 	var m StoredMessage
 	err := tx.QueryRow(ctx,
 		`SELECT conversation_id, client_msg_id, server_msg_id, seq, sender_session, text, server_ts
-		   FROM arc.messages
+		   FROM `+messagesTable+`
 		  WHERE conversation_id = $1 AND client_msg_id = $2`,
 		conversationID, clientMsgID,
 	).Scan(&m.ConversationID, &m.ClientMsgID, &m.ServerMsgID, &m.Seq, &m.SenderSession, &m.Text, &m.ServerTS)
 	return m, err
+}
+
+var pgIdentRE = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+func isValidPGIdent(s string) bool {
+	return pgIdentRE.MatchString(s)
+}
+
+func pgIdent(schema, table string) string {
+	// pgx.Identifier safely quotes identifiers, preventing SQL injection.
+	return pgx.Identifier{schema, table}.Sanitize()
 }

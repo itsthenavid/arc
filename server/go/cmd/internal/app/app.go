@@ -143,7 +143,11 @@ func newStore(ctx context.Context, cfg Config, log Logger) (Store, *pgxpool.Pool
 	// Ownership model:
 	// - app owns pool lifecycle
 	// - PostgresStore.Close() is a no-op
-	msgStore := realtime.NewPostgresStore(pool)
+	msgStore, err := realtime.NewPostgresStore(pool) // default schema "arc"
+	if err != nil {
+		pool.Close()
+		return nil, nil, false, nil, err
+	}
 
 	return dbStore{pool: pool, msgStore: msgStore}, pool, true, msgStore, nil
 }
