@@ -1,20 +1,34 @@
+// Package identity password hashing (Argon2id).
+//
+// This file preserves identity's public API:
+//
+//   - Argon2idParams
+//   - DefaultArgon2idParams
+//   - HashPassword
+//   - VerifyPassword
+//
+// while using cmd/security/password as the single source of truth for:
+//   - Argon2id parameters (defaults + env overrides)
+//   - password policy (defaults + env overrides)
+//   - strict PHC decoding + anti-DoS bounds during Verify
+//
+// English notes:
+// - identity MUST NOT silently drift from security/password configuration.
+// - identity keeps a historical baseline of min length 8, but will honor stricter env policy.
 package identity
 
 import (
-	"crypto/rand"
-	"crypto/subtle"
-	"encoding/base64"
 	"errors"
-	"fmt"
-	"runtime"
-	"strconv"
-	"strings"
 
-	"golang.org/x/crypto/argon2"
+	"arc/cmd/security/password"
 )
 
 // Argon2idParams defines Argon2id hashing parameters for password hashing.
 // These values must be chosen carefully to balance security and performance.
+//
+// IMPORTANT:
+// identity keeps this type for API compatibility. Internally we merge it with
+// the security/password config (env + defaults) to avoid split-brain settings.
 type Argon2idParams struct {
 	MemoryKiB uint32
 	Time      uint32
@@ -23,150 +37,138 @@ type Argon2idParams struct {
 	KeyLen    uint32
 }
 
-// DefaultArgon2idParams are safe modern defaults for interactive logins.
-// MemoryKiB=65536 => 64 MiB
+// DefaultArgon2idParams returns the effective defaults based on security/password.
+// This is the canonical "default" surface for identity callers.
 func DefaultArgon2idParams() Argon2idParams {
-	// English comment:
-	// Use a CPU-aware thread count to avoid instability on low-core machines/containers.
-	// Keep a conservative cap of 4 while enforcing minimum 1.
-	threads := runtime.NumCPU()
-	if threads <= 0 {
-		threads = 1
-	}
-	if threads > 4 {
-		threads = 4
+	cfg, err := password.FromEnv()
+	if err != nil {
+		// English comment:
+		// FromEnv should never fail under normal circumstances. If it does, fall back to DefaultConfig.
+		cfg = password.DefaultConfig()
 	}
 
 	return Argon2idParams{
-		MemoryKiB: 65536,
-		Time:      1,
-		Threads:   uint8(threads), // #nosec G115 -- threads is clamped to [1..4] above; safe conversion.
-		SaltLen:   16,
-		KeyLen:    32,
+		MemoryKiB: cfg.Params.MemoryKiB,
+		Time:      cfg.Params.Iterations,
+		Threads:   cfg.Params.Parallelism,
+		SaltLen:   cfg.Params.SaltLength,
+		KeyLen:    cfg.Params.KeyLength,
 	}
 }
 
 // HashPassword returns a PHC-style Argon2id hash string.
-func HashPassword(password string, p Argon2idParams) (string, error) {
-	if len(password) < 8 {
+//
+// Security contract:
+// - Enforces a baseline min length of 8 for backwards compatibility.
+// - Will honor stricter password policy from env (via security/password).
+func HashPassword(passwordPlain string, p Argon2idParams) (string, error) {
+	if len(passwordPlain) < 8 {
 		return "", errors.New("password too short")
 	}
 
-	// English comment:
-	// Defensive normalization of threads to ensure argon2.IDKey does not receive 0.
-	if p.Threads == 0 {
-		p.Threads = 1
-	}
-
-	salt := make([]byte, p.SaltLen)
-	if _, err := rand.Read(salt); err != nil {
+	cfg, err := password.FromEnv()
+	if err != nil {
+		// Treat invalid env as an operational error, not a weak fallback.
 		return "", err
 	}
 
-	key := argon2.IDKey([]byte(password), salt, p.Time, p.MemoryKiB, p.Threads, p.KeyLen)
+	// English comment:
+	// identity baseline is min 8 chars, but env may be stricter. We always take the stricter one.
+	if cfg.Policy.MinLength < 8 {
+		cfg.Policy.MinLength = 8
+	}
+	// Keep identity historical cap if env is smaller (but allow env to tighten it).
+	if cfg.Policy.MaxLength <= 0 {
+		cfg.Policy.MaxLength = 256
+	}
 
-	b64 := base64.RawStdEncoding
-	saltB64 := b64.EncodeToString(salt)
-	keyB64 := b64.EncodeToString(key)
+	// Merge caller-provided params (non-zero fields override env/defaults).
+	cfg.Params = mergeIdentityParams(cfg.Params, p)
 
-	// PHC format:
-	// $argon2id$v=19$m=65536,t=1,p=4$<salt>$<hash>
-	return fmt.Sprintf("$argon2id$v=19$m=%d,t=%d,p=%d$%s$%s",
-		p.MemoryKiB, p.Time, p.Threads, saltB64, keyB64,
-	), nil
+	enc, err := cfg.Hash(passwordPlain)
+	if err != nil {
+		// English comment:
+		// Use errors.Is (not equality) to remain correct if security/password wraps errors.
+		switch {
+		case errors.Is(err, password.ErrPasswordTooShort):
+			return "", errors.New("password too short")
+		case errors.Is(err, password.ErrPasswordTooLong):
+			return "", errors.New("password too long")
+		case errors.Is(err, password.ErrWeakPassword):
+			return "", errors.New("weak password")
+		default:
+			return "", err
+		}
+	}
+
+	return enc, nil
 }
 
 // VerifyPassword checks a password against a PHC Argon2id hash.
-func VerifyPassword(password string, encoded string) (bool, error) {
-	p, salt, hash, err := parsePHCArgon2id(encoded)
+//
+// Security contract:
+// - Strict PHC parsing.
+// - Anti-DoS: verification refuses hashes with parameters wildly above configured maxima.
+func VerifyPassword(passwordPlain string, encodedPHC string) (bool, error) {
+	cfg, err := password.FromEnv()
 	if err != nil {
 		return false, err
 	}
 
-	hashLen := len(hash)
-	if hashLen > 4294967295 { // max uint32
-		return false, errors.New("hash length exceeds maximum")
-	}
-
 	// English comment:
-	// Argon2 parameters are embedded in the PHC string; enforce threads >= 1 defensively.
-	if p.Threads == 0 {
-		p.Threads = 1
+	// identity baseline min length 8 (env can be stricter; baseline doesn't weaken it).
+	if cfg.Policy.MinLength < 8 {
+		cfg.Policy.MinLength = 8
+	}
+	if cfg.Policy.MaxLength <= 0 {
+		cfg.Policy.MaxLength = 256
 	}
 
-	key := argon2.IDKey([]byte(password), salt, p.Time, p.MemoryKiB, p.Threads, uint32(hashLen))
-	if subtle.ConstantTimeCompare(key, hash) == 1 {
-		return true, nil
+	ok, err := cfg.Verify(encodedPHC, passwordPlain)
+	if err != nil {
+		if errors.Is(err, password.ErrInvalidHash) {
+			return false, errors.New("invalid argon2id hash format")
+		}
+		return false, err
 	}
-	return false, nil
+	return ok, nil
 }
 
-func parsePHCArgon2id(s string) (Argon2idParams, []byte, []byte, error) {
-	// expected: $argon2id$v=19$m=...,t=...,p=...$salt$hash
-	parts := strings.Split(s, "$")
-	if len(parts) != 6 || parts[1] != "argon2id" {
-		return Argon2idParams{}, nil, nil, errors.New("invalid argon2id hash format")
+func mergeIdentityParams(base password.Argon2idParams, p Argon2idParams) password.Argon2idParams {
+	// English comment:
+	// Only apply non-zero overrides to keep env/defaults as the canonical source.
+	if p.MemoryKiB != 0 {
+		base.MemoryKiB = p.MemoryKiB
 	}
-	if parts[2] != "v=19" {
-		return Argon2idParams{}, nil, nil, errors.New("unsupported argon2 version")
+	if p.Time != 0 {
+		base.Iterations = p.Time
 	}
-
-	paramPart := parts[3]
-	params := DefaultArgon2idParams()
-
-	kv := strings.Split(paramPart, ",")
-	for _, item := range kv {
-		item = strings.TrimSpace(item)
-		if item == "" {
-			continue
-		}
-		pair := strings.SplitN(item, "=", 2)
-		if len(pair) != 2 {
-			return Argon2idParams{}, nil, nil, errors.New("invalid argon2 params")
-		}
-		k := pair[0]
-		v := pair[1]
-		switch k {
-		case "m":
-			n, err := strconv.ParseUint(v, 10, 32)
-			if err != nil {
-				return Argon2idParams{}, nil, nil, err
-			}
-			params.MemoryKiB = uint32(n)
-		case "t":
-			n, err := strconv.ParseUint(v, 10, 32)
-			if err != nil {
-				return Argon2idParams{}, nil, nil, err
-			}
-			params.Time = uint32(n)
-		case "p":
-			n, err := strconv.ParseUint(v, 10, 8)
-			if err != nil {
-				return Argon2idParams{}, nil, nil, err
-			}
-			if n == 0 {
-				return Argon2idParams{}, nil, nil, errors.New("invalid argon2 threads (p=0)")
-			}
-			params.Threads = uint8(n)
-		default:
-			return Argon2idParams{}, nil, nil, errors.New("unknown argon2 param")
-		}
+	if p.Threads != 0 {
+		base.Parallelism = p.Threads
+	}
+	if p.SaltLen != 0 {
+		base.SaltLength = p.SaltLen
+	}
+	if p.KeyLen != 0 {
+		base.KeyLength = p.KeyLen
 	}
 
-	b64 := base64.RawStdEncoding
-
-	salt, err := b64.DecodeString(parts[4])
-	if err != nil {
-		return Argon2idParams{}, nil, nil, err
+	// Defensive minima (argon2 requires these to be sane).
+	if base.Parallelism == 0 {
+		base.Parallelism = 1
 	}
-	hash, err := b64.DecodeString(parts[5])
-	if err != nil {
-		return Argon2idParams{}, nil, nil, err
+	if base.Iterations == 0 {
+		base.Iterations = 1
+	}
+	if base.MemoryKiB < 8*1024 {
+		base.MemoryKiB = 8 * 1024
+	}
+	if base.SaltLength < 8 {
+		base.SaltLength = 16
+	}
+	if base.KeyLength < 16 {
+		base.KeyLength = 32
 	}
 
-	if len(salt) < 8 || len(hash) < 16 {
-		return Argon2idParams{}, nil, nil, errors.New("invalid argon2 payload")
-	}
-
-	return params, salt, hash, nil
+	return base
 }
