@@ -13,29 +13,36 @@ import (
 )
 
 // Version is the protocol version identifier embedded into every envelope.
-const Version = "v1"
+// It MUST match docs/spec/realtime-v1.md ("v": 1).
+const Version = 1
 
 // Type constants (wire-stable).
 const (
 	// TypeHello starts a session handshake (client -> server).
 	TypeHello = "hello"
 	// TypeHelloAck acknowledges the session handshake (server -> client).
-	TypeHelloAck = "hello_ack"
+	TypeHelloAck = "hello.ack"
 
 	// TypeConversationJoin joins a conversation (client -> server) and is echoed back.
-	TypeConversationJoin = "conversation_join"
+	TypeConversationJoin = "conversation.join"
 
 	// TypeMessageSend requests sending a new message (client -> server).
-	TypeMessageSend = "message_send"
+	TypeMessageSend = "message.send"
 	// TypeMessageAck acknowledges a send request (server -> client).
-	TypeMessageAck = "message_ack"
+	TypeMessageAck = "message.ack"
 	// TypeMessageNew broadcasts a newly accepted message (server -> conversation members).
-	TypeMessageNew = "message_new"
+	TypeMessageNew = "message.new"
+
+	// TypeMessageRead signals read position update (client -> server) (future-compatible for Phase 1/2).
+	TypeMessageRead = "message.read"
+
+	// TypeSystemNew is a server broadcast for system messages (future-compatible).
+	TypeSystemNew = "system.new"
 
 	// TypeConversationHistoryFetch requests conversation history (client -> server).
-	TypeConversationHistoryFetch = "conversation_history_fetch"
+	TypeConversationHistoryFetch = "conversation.history.fetch"
 	// TypeConversationHistoryChunk returns a window of history (server -> client).
-	TypeConversationHistoryChunk = "conversation_history_chunk"
+	TypeConversationHistoryChunk = "conversation.history.chunk"
 
 	// TypeError is a generic error envelope (server -> client).
 	TypeError = "error"
@@ -43,7 +50,7 @@ const (
 
 // Envelope is the canonical wire wrapper.
 type Envelope struct {
-	V       string          `json:"v"`
+	V       int             `json:"v"`
 	Type    string          `json:"type"`
 	ID      string          `json:"id,omitempty"`
 	ConvID  string          `json:"conv_id,omitempty"`
@@ -53,11 +60,11 @@ type Envelope struct {
 
 // Validate performs strict structural validation for an Envelope.
 func (e Envelope) Validate() error {
-	if strings.TrimSpace(e.V) == "" {
+	if e.V == 0 {
 		return errors.New("missing field: v")
 	}
 	if e.V != Version {
-		return fmt.Errorf("unsupported protocol version: %q", e.V)
+		return fmt.Errorf("unsupported protocol version: %d", e.V)
 	}
 	if strings.TrimSpace(e.Type) == "" {
 		return errors.New("missing field: type")
@@ -70,6 +77,8 @@ func (e Envelope) Validate() error {
 		TypeMessageSend,
 		TypeMessageAck,
 		TypeMessageNew,
+		TypeMessageRead,
+		TypeSystemNew,
 		TypeConversationHistoryFetch,
 		TypeConversationHistoryChunk,
 		TypeError:
@@ -82,7 +91,10 @@ func (e Envelope) Validate() error {
 // ---- Payloads ----
 
 // HelloPayload is sent by the client to initiate a session.
-type HelloPayload struct{}
+// token is required by docs/spec/realtime-v1.md (MVP baseline).
+type HelloPayload struct {
+	Token string `json:"token,omitempty"`
+}
 
 // HelloAckPayload must carry SessionID (used by ws-smoke + server logic).
 type HelloAckPayload struct {
@@ -92,7 +104,7 @@ type HelloAckPayload struct {
 // ConversationJoinPayload requests membership in a conversation.
 type ConversationJoinPayload struct {
 	ConversationID string `json:"conversation_id"`
-	Kind           string `json:"kind,omitempty"`
+	Kind           string `json:"kind,omitempty"` // "direct" | "group" (optional hint)
 }
 
 // MessageSendPayload requests sending a message into a conversation.
@@ -117,6 +129,21 @@ type MessageNewPayload struct {
 	ServerMsgID    string    `json:"server_msg_id"`
 	Seq            int64     `json:"seq"`
 	Sender         string    `json:"sender"`
+	Text           string    `json:"text"`
+	ServerTS       time.Time `json:"server_ts"`
+}
+
+// MessageReadPayload updates the read cursor for a conversation (future-compatible).
+type MessageReadPayload struct {
+	ConversationID string `json:"conversation_id"`
+	UpToSeq        int64  `json:"up_to_seq"`
+}
+
+// SystemNewPayload represents a server-emitted system message (future-compatible).
+type SystemNewPayload struct {
+	ConversationID string    `json:"conversation_id"`
+	SystemMsgID    string    `json:"system_msg_id"`
+	Seq            int64     `json:"seq"`
 	Text           string    `json:"text"`
 	ServerTS       time.Time `json:"server_ts"`
 }
