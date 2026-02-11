@@ -20,6 +20,10 @@ type Config struct {
 	// If true:
 	// - /readyz returns 503 unless DB is configured and reachable.
 	ReadinessRequireDB bool
+
+	// Security policy:
+	// If true, ARC_TOKEN_HMAC_KEY MUST be set (>= 32 bytes) and refresh-token hashing must be HMAC-based.
+	RequireTokenHMAC bool
 }
 
 // LoadConfig loads Config from environment variables with defaults.
@@ -40,5 +44,7 @@ func LoadConfig() Config {
 		DBMinConns:  EnvInt32("ARC_DB_MIN_CONNS", 0),
 
 		ReadinessRequireDB: EnvBool("ARC_READINESS_REQUIRE_DB", false),
+
+		RequireTokenHMAC: EnvBool("ARC_REQUIRE_TOKEN_HMAC", false),
 	}
 }

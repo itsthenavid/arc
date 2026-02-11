@@ -12,6 +12,12 @@ func Run() error {
 	cfg := LoadConfig()
 	log := NewLogger(cfg.LogLevel)
 
+	// Enforce security policy before wiring dependencies.
+	if err := ValidateSecurityConfig(cfg); err != nil {
+		log.Error("config.security.invalid", "err", err)
+		return err
+	}
+
 	a, err := New(cfg, log)
 	if err != nil {
 		return err
