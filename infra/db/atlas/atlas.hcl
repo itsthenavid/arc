@@ -7,11 +7,9 @@ variable "atlas_url" {
 }
 
 variable "atlas_dev_url" {
-  type = string
-  // Prefer explicit dev url, then atlas_url, then database_url.
-  default = getenv("ARC_ATLAS_DEV_URL") != "" ? getenv("ARC_ATLAS_DEV_URL") : (
-    getenv("ARC_ATLAS_URL") != "" ? getenv("ARC_ATLAS_URL") : getenv("ARC_DATABASE_URL")
-  )
+  type    = string
+  // Always isolate dev DB. Never default to the real DB.
+  default = getenv("ARC_ATLAS_DEV_URL") != "" ? getenv("ARC_ATLAS_DEV_URL") : "docker://postgres/16/dev"
 }
 
 env "local" {
@@ -19,7 +17,6 @@ env "local" {
   dev = var.atlas_dev_url
 
   schema {
-    // Relative to this atlas.hcl directory.
     src = "file://schema.sql"
   }
 }

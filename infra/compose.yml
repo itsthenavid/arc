@@ -43,7 +43,11 @@ services:
     volumes:
       - arc_postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-arc} -d ${POSTGRES_DB:-arc}"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-arc} -d ${POSTGRES_DB:-arc}",
+        ]
       interval: 5s
       timeout: 3s
       retries: 30
@@ -89,6 +93,9 @@ services:
     environment:
       ARC_DATABASE_URL: ${ARC_DATABASE_URL:-postgres://arc:arc_dev_password@postgres:5432/arc?sslmode=disable}
       ARC_REDIS_ADDR: ${ARC_REDIS_ADDR:-redis:6379}
+      ARC_PASETO_V4_SECRET_KEY_HEX: ${ARC_PASETO_V4_SECRET_KEY_HEX:-}
+      ARC_REQUIRE_TOKEN_HMAC: ${ARC_REQUIRE_TOKEN_HMAC:-false}
+      ARC_TOKEN_HMAC_KEY: ${ARC_TOKEN_HMAC_KEY:-}
     logging: *default-logging
     networks:
       - arc_net
