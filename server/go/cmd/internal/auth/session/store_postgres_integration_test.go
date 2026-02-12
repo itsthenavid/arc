@@ -3,7 +3,10 @@ package session
 import (
 	"context"
 	"crypto/rand"
+	"errors"
+	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +14,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/oklog/ulid/v2"
 )
+
+// Integration tests are enabled when ARC_DATABASE_URL is set.
+// In non-CI runs, unreachable Postgres skips these tests to keep local runs fast.
 
 func TestPostgresSession_IssueAndRotateRefresh_Succeeds(t *testing.T) {
 	t.Parallel()
@@ -405,6 +411,9 @@ func mustPGXPool(ctx context.Context, t *testing.T, dbURL string) *pgxpool.Pool 
 
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
+		if shouldSkipIntegration(err) {
+			t.Skipf("integration test skipped: Postgres unreachable (ARC_DATABASE_URL set): %v", err)
+		}
 		t.Fatalf("pool.Ping: %v", err)
 	}
 
@@ -425,6 +434,32 @@ func mustTestConfigAndTokens(t *testing.T) (Config, AccessTokenManager) {
 	}
 
 	return cfg, tokens
+}
+
+func shouldSkipIntegration(err error) bool {
+	if err == nil {
+		return false
+	}
+	if os.Getenv("CI") != "" {
+		return false
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "context deadline exceeded") ||
+		strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "dial tcp") ||
+		strings.Contains(msg, "no such host") {
+		return true
+	}
+	return false
 }
 
 func newULID(t *testing.T) string {

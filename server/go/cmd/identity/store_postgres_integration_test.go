@@ -14,11 +14,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Integration tests are opt-in and require:
-//   - build tag: -tags=integration
-//   - env: ARC_DATABASE_URL
-//
-// This keeps default `go test ./...` fast and deterministic without requiring Postgres.
+// Integration tests are opt-in and require ARC_DATABASE_URL.
+// In non-CI runs, unreachable Postgres skips these tests to keep local runs fast.
 
 func TestPostgresStore_CreateUser_ConflictUsername_CaseInsensitive(t *testing.T) {
 	t.Parallel()
@@ -497,6 +494,9 @@ func mustOpenTestPool(t *testing.T) *pgxpool.Pool {
 	c, err := pool.Acquire(pingCtx)
 	if err != nil {
 		pool.Close()
+		if shouldSkipIntegration(err) {
+			t.Skipf("integration test skipped: Postgres unreachable (ARC_DATABASE_URL set): %v", err)
+		}
 		t.Fatalf("acquire: %v", err)
 	}
 	c.Release()
@@ -614,6 +614,32 @@ CREATE INDEX IF NOT EXISTS idx_sessions_replaced_by
 	if _, err := pool.Exec(ctx, schemaSQL); err != nil {
 		t.Fatalf("apply schema: %v", err)
 	}
+}
+
+func shouldSkipIntegration(err error) bool {
+	if err == nil {
+		return false
+	}
+	if os.Getenv("CI") != "" {
+		return false
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "context deadline exceeded") ||
+		strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "dial tcp") ||
+		strings.Contains(msg, "no such host") {
+		return true
+	}
+	return false
 }
 
 func mustExec(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) {

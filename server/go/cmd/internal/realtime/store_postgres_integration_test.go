@@ -2,7 +2,9 @@ package realtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"sort"
 	"strings"
@@ -15,7 +17,7 @@ import (
 )
 
 // Integration tests are enabled when ARC_DATABASE_URL is set.
-// This keeps local "go test ./..." fast & deterministic without requiring Postgres.
+// In non-CI runs, unreachable Postgres skips these tests to keep local runs fast.
 
 func TestPostgresStore_Append_Dedupe_NoSeqWaste(t *testing.T) {
 	t.Parallel()
@@ -282,6 +284,9 @@ func mustOpenTestPool(t *testing.T) *pgxpool.Pool {
 	c, err := pool.Acquire(pingCtx)
 	if err != nil {
 		pool.Close()
+		if shouldSkipIntegration(err) {
+			t.Skipf("integration test skipped: Postgres unreachable (ARC_DATABASE_URL set): %v", err)
+		}
 		t.Fatalf("acquire: %v", err)
 	}
 	c.Release()
@@ -366,6 +371,32 @@ CREATE INDEX IF NOT EXISTS idx_messages_conversation_client_msg
 	if _, err := pool.Exec(ctx, schemaSQL); err != nil {
 		t.Fatalf("apply schema: %v", err)
 	}
+}
+
+func shouldSkipIntegration(err error) bool {
+	if err == nil {
+		return false
+	}
+	if os.Getenv("CI") != "" {
+		return false
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "context deadline exceeded") ||
+		strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "dial tcp") ||
+		strings.Contains(msg, "no such host") {
+		return true
+	}
+	return false
 }
 
 func mustCountMessages(t *testing.T, pool *pgxpool.Pool, schema string, conversationID string) int {
