@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# shellcheck.sh - Run ShellCheck deterministically across repo shell scripts.
+# sc-runner.sh - Run ShellCheck deterministically across repo shell scripts.
 # Compatible with Bash 3.2 (macOS default /bin/bash). Avoids `mapfile`.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -43,7 +43,7 @@ while IFS= read -r f; do
   # Read first line safely (ignore binary / unreadable).
   first_line="$(LC_ALL=C sed -n '1p' "${f}" 2> /dev/null || true)"
   case "${first_line}" in
-    '#!'*'sh'* | '#!'*'bash'*)
+    '#!'*'sh'*)
       files+=("${f}")
       ;;
   esac
@@ -67,8 +67,14 @@ echo "shellcheck: ${#uniq_files[@]} file(s)"
 # Run ShellCheck
 # - Use bash by default (most of our scripts are bash), but ShellCheck will infer from shebang too.
 # - Keep output stable.
-shellcheck ${SHELLCHECK_RC} \
-  --format=gcc \
-  "${uniq_files[@]}"
+if [[ -n "${SHELLCHECK_RC}" ]]; then
+  shellcheck "${SHELLCHECK_RC}" \
+    --format=gcc \
+    "${uniq_files[@]}"
+else
+  shellcheck \
+    --format=gcc \
+    "${uniq_files[@]}"
+fi
 
 echo "OK: shellcheck"

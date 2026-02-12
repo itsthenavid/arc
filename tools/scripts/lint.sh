@@ -7,6 +7,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONFIG_FILE="$ROOT_DIR/.golangci.yml"
 
+# Use writable caches in restrictive environments (e.g. sandboxed CI/local).
+: "${GOCACHE:=/tmp/arc-gocache}"
+: "${GOLANGCI_LINT_CACHE:=/tmp/arc-golangci-cache}"
+mkdir -p "${GOCACHE}" "${GOLANGCI_LINT_CACHE}"
+export GOCACHE GOLANGCI_LINT_CACHE
+
 if [[ ! -f "$CONFIG_FILE" ]]; then
   echo "ERROR: missing golangci config: $CONFIG_FILE" >&2
   exit 1
