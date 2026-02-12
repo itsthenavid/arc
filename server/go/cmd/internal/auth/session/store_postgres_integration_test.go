@@ -387,8 +387,14 @@ func TestPostgresSession_TouchSession_UpdatesLastUsed(t *testing.T) {
 	}
 
 	row := mustGetSessionByID(ctx, t, pool, issued.SessionID)
-	if row.LastUsedAt == nil || !row.LastUsedAt.Equal(next) {
-		t.Fatalf("expected last_used_at=%v, got %v", next, row.LastUsedAt)
+	if row.LastUsedAt == nil {
+		t.Fatalf("expected last_used_at set, got nil")
+	}
+	// Postgres timestamps are microsecond-precision; compare at that granularity.
+	got := row.LastUsedAt.UTC().Truncate(time.Microsecond)
+	want := next.UTC().Truncate(time.Microsecond)
+	if !got.Equal(want) {
+		t.Fatalf("expected last_used_at=%v, got %v", want, got)
 	}
 }
 
