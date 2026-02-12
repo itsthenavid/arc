@@ -6,16 +6,20 @@ with correct cookie/CSRF behavior for web and token headers for native.
 
 ### Scope
 **HTTP Routes (server/go/cmd/internal/app/http.go wiring)**
-- `POST /v1/auth/signup` (invite + username/password; email optional)
-- `POST /v1/auth/login` (username OR email + password)
-- `POST /v1/auth/refresh`
-- `POST /v1/auth/logout` (current session)
-- `POST /v1/auth/logout_all`
-- `GET  /v1/me`
+- `POST /auth/invites/create` (auth required; returns invite token)
+- `POST /auth/invites/consume` (invite + username/password; email optional)
+- `POST /auth/login` (username OR email + password)
+- `POST /auth/refresh`
+- `POST /auth/logout` (current session)
+- `POST /auth/logout_all`
+- `GET  /me`
 
 **Request/Response Contracts (shared/contracts/auth/v1 OR server-local if ADR chose)**
-- Signup:
-  - input: invite_token, username?, email?, password
+- Invite create:
+  - input: `expires_in_seconds?`, `max_uses?`, `note?` (note max 512 chars)
+  - output: invite_id + invite_token + expires_at
+- Invite consume (signup):
+  - input: invite_token (required if invite-only), username?, email?, password
   - output: me + tokens (or cookie set)
 - Login:
   - input: identifier (email/username), password, remember_me?, device info
