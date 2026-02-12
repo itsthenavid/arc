@@ -42,6 +42,22 @@ type Session struct {
 	IP        *net.IP
 }
 
+// UserAuth is a user with its password hash (for login verification).
+type UserAuth struct {
+	User         User
+	PasswordHash string
+}
+
+// Invite represents an invite token row.
+type Invite struct {
+	ID         string
+	CreatedBy  *string
+	CreatedAt  time.Time
+	ExpiresAt  time.Time
+	ConsumedAt *time.Time
+	ConsumedBy *string
+}
+
 // CreateUserInput describes a user registration request.
 // At least one of Username or Email must be provided.
 type CreateUserInput struct {
@@ -74,10 +90,49 @@ type CreateSessionResult struct {
 	RefreshToken string
 }
 
+// CreateInviteInput describes invite creation.
+type CreateInviteInput struct {
+	CreatedBy *string
+	TTL       time.Duration
+	Now       time.Time
+}
+
+// CreateInviteResult returns the created invite and its plain token.
+type CreateInviteResult struct {
+	Invite Invite
+	Token  string
+}
+
+// ConsumeInviteInput describes invite consumption and user creation.
+type ConsumeInviteInput struct {
+	Token      string
+	Username   *string
+	Email      *string
+	Password   string
+	Now        time.Time
+	SessionTTL time.Duration
+	Platform   string
+	UserAgent  *string
+	IP         *net.IP
+}
+
+// ConsumeInviteResult returns the created user, session, and the consumed invite.
+type ConsumeInviteResult struct {
+	User         User
+	Session      Session
+	RefreshToken string
+	Invite       Invite
+}
+
 // Store is the identity/auth persistence boundary.
 type Store interface {
 	CreateUser(ctx context.Context, in CreateUserInput) (CreateUserResult, error)
+	GetUserByID(ctx context.Context, userID string) (User, error)
+	GetUserAuthByUsername(ctx context.Context, username string) (UserAuth, error)
+	GetUserAuthByEmail(ctx context.Context, email string) (UserAuth, error)
 	CreateSession(ctx context.Context, in CreateSessionInput) (CreateSessionResult, error)
+	CreateInvite(ctx context.Context, in CreateInviteInput) (CreateInviteResult, error)
+	ConsumeInviteAndCreateUser(ctx context.Context, in ConsumeInviteInput) (ConsumeInviteResult, error)
 
 	// RotateRefreshToken rotates refresh token for an active session.
 	//

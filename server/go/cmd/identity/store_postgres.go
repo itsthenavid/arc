@@ -84,42 +84,9 @@ func (s *PostgresStore) CreateUser(ctx context.Context, in CreateUserInput) (Cre
 		return CreateUserResult{}, err
 	}
 
-	username := pgTrimPtr(in.Username)
-	email := pgTrimPtr(in.Email)
-
-	if username == nil && email == nil {
-		return CreateUserResult{}, pgInvalid(op, "username or email is required")
-	}
-	if strings.TrimSpace(in.Password) == "" {
-		return CreateUserResult{}, pgInvalid(op, "password is required")
-	}
-
 	now := in.Now
 	if now.IsZero() {
 		now = time.Now().UTC()
-	}
-
-	// Normalize identity fields.
-	var usernameNorm *string
-	if username != nil {
-		n := NormalizeUsername(*username)
-		usernameNorm = &n
-	}
-	var emailNorm *string
-	if email != nil {
-		n := NormalizeEmail(*email)
-		emailNorm = &n
-	}
-
-	// Hash password.
-	pwHash, err := HashPassword(in.Password, DefaultArgon2idParams())
-	if err != nil {
-		return CreateUserResult{}, pgInvalid(op, err.Error())
-	}
-
-	userID, err := NewULID(now)
-	if err != nil {
-		return CreateUserResult{}, err
 	}
 
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{
@@ -131,34 +98,8 @@ func (s *PostgresStore) CreateUser(ctx context.Context, in CreateUserInput) (Cre
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	users := pgIdent(s.schema, "users")
-	creds := pgIdent(s.schema, "user_credentials")
-
-	_, err = tx.Exec(ctx,
-		`INSERT INTO `+users+` (
-		     id, username, username_norm, email, email_norm, created_at
-		   ) VALUES ($1, $2, $3, $4, $5, $6)`,
-		userID,
-		username,
-		usernameNorm,
-		email,
-		emailNorm,
-		now,
-	)
+	user, err := s.insertUserAndCredsTx(ctx, tx, op, in, now)
 	if err != nil {
-		if field, ok := pgClassifyUniqueViolation(err); ok {
-			return CreateUserResult{}, ConflictError{Op: op, Field: field}
-		}
-		return CreateUserResult{}, err
-	}
-
-	_, err = tx.Exec(ctx,
-		`INSERT INTO `+creds+` (user_id, password_hash, created_at, updated_at)
-		 VALUES ($1, $2, $3, $3)`,
-		userID, pwHash, now,
-	)
-	if err != nil {
-		// If FK fails here, it indicates programming/schema inconsistency.
 		return CreateUserResult{}, err
 	}
 
@@ -166,16 +107,141 @@ func (s *PostgresStore) CreateUser(ctx context.Context, in CreateUserInput) (Cre
 		return CreateUserResult{}, err
 	}
 
-	out := User{
-		ID:           userID,
-		Username:     username,
-		UsernameNorm: usernameNorm,
-		Email:        email,
-		EmailNorm:    emailNorm,
-		CreatedAt:    now,
+	return CreateUserResult{User: user}, nil
+}
+
+// GetUserByID fetches a user by ID.
+func (s *PostgresStore) GetUserByID(ctx context.Context, userID string) (User, error) {
+	const op = "identity.GetUserByID"
+
+	if s == nil || s.pool == nil {
+		return User{}, OpError{Op: op, Kind: ErrInvalidInput, Msg: "nil store"}
+	}
+	if err := ctx.Err(); err != nil {
+		return User{}, err
+	}
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return User{}, pgInvalid(op, "missing user_id")
 	}
 
-	return CreateUserResult{User: out}, nil
+	users := pgIdent(s.schema, "users")
+
+	var out User
+	err := s.pool.QueryRow(ctx,
+		`SELECT id, username, username_norm, email, email_norm, display_name, bio, created_at
+		   FROM `+users+`
+		  WHERE id = $1`,
+		userID,
+	).Scan(
+		&out.ID,
+		&out.Username,
+		&out.UsernameNorm,
+		&out.Email,
+		&out.EmailNorm,
+		&out.DisplayName,
+		&out.Bio,
+		&out.CreatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return User{}, ErrNotFound
+		}
+		return User{}, err
+	}
+	return out, nil
+}
+
+// GetUserAuthByUsername fetches a user + credentials by normalized username.
+func (s *PostgresStore) GetUserAuthByUsername(ctx context.Context, username string) (UserAuth, error) {
+	const op = "identity.GetUserAuthByUsername"
+
+	if s == nil || s.pool == nil {
+		return UserAuth{}, OpError{Op: op, Kind: ErrInvalidInput, Msg: "nil store"}
+	}
+	if err := ctx.Err(); err != nil {
+		return UserAuth{}, err
+	}
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return UserAuth{}, pgInvalid(op, "missing username")
+	}
+
+	usernameNorm := NormalizeUsername(username)
+	users := pgIdent(s.schema, "users")
+	creds := pgIdent(s.schema, "user_credentials")
+
+	var out UserAuth
+	err := s.pool.QueryRow(ctx,
+		`SELECT u.id, u.username, u.username_norm, u.email, u.email_norm, u.display_name, u.bio, u.created_at, c.password_hash
+		   FROM `+users+` u
+		   JOIN `+creds+` c ON c.user_id = u.id
+		  WHERE u.username_norm = $1`,
+		usernameNorm,
+	).Scan(
+		&out.User.ID,
+		&out.User.Username,
+		&out.User.UsernameNorm,
+		&out.User.Email,
+		&out.User.EmailNorm,
+		&out.User.DisplayName,
+		&out.User.Bio,
+		&out.User.CreatedAt,
+		&out.PasswordHash,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return UserAuth{}, ErrNotFound
+		}
+		return UserAuth{}, err
+	}
+	return out, nil
+}
+
+// GetUserAuthByEmail fetches a user + credentials by normalized email.
+func (s *PostgresStore) GetUserAuthByEmail(ctx context.Context, email string) (UserAuth, error) {
+	const op = "identity.GetUserAuthByEmail"
+
+	if s == nil || s.pool == nil {
+		return UserAuth{}, OpError{Op: op, Kind: ErrInvalidInput, Msg: "nil store"}
+	}
+	if err := ctx.Err(); err != nil {
+		return UserAuth{}, err
+	}
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return UserAuth{}, pgInvalid(op, "missing email")
+	}
+
+	emailNorm := NormalizeEmail(email)
+	users := pgIdent(s.schema, "users")
+	creds := pgIdent(s.schema, "user_credentials")
+
+	var out UserAuth
+	err := s.pool.QueryRow(ctx,
+		`SELECT u.id, u.username, u.username_norm, u.email, u.email_norm, u.display_name, u.bio, u.created_at, c.password_hash
+		   FROM `+users+` u
+		   JOIN `+creds+` c ON c.user_id = u.id
+		  WHERE u.email_norm = $1`,
+		emailNorm,
+	).Scan(
+		&out.User.ID,
+		&out.User.Username,
+		&out.User.UsernameNorm,
+		&out.User.Email,
+		&out.User.EmailNorm,
+		&out.User.DisplayName,
+		&out.User.Bio,
+		&out.User.CreatedAt,
+		&out.PasswordHash,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return UserAuth{}, ErrNotFound
+		}
+		return UserAuth{}, err
+	}
+	return out, nil
 }
 
 // CreateSession creates a new refresh-token backed session for a user.
@@ -284,6 +350,150 @@ func (s *PostgresStore) CreateSession(ctx context.Context, in CreateSessionInput
 	}
 
 	return CreateSessionResult{Session: out, RefreshToken: plain}, nil
+}
+
+// CreateInvite creates a new invite token.
+func (s *PostgresStore) CreateInvite(ctx context.Context, in CreateInviteInput) (CreateInviteResult, error) {
+	const op = "identity.CreateInvite"
+
+	if s == nil || s.pool == nil {
+		return CreateInviteResult{}, OpError{Op: op, Kind: ErrInvalidInput, Msg: "nil store"}
+	}
+	if err := ctx.Err(); err != nil {
+		return CreateInviteResult{}, err
+	}
+
+	now := in.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	ttl := in.TTL
+	if ttl <= 0 {
+		ttl = 7 * 24 * time.Hour
+	}
+
+	tokenPlain, err := NewOpaqueToken(32)
+	if err != nil {
+		return CreateInviteResult{}, err
+	}
+	tokenHash := HashRefreshTokenHex(tokenPlain)
+
+	inviteID, err := NewULID(now)
+	if err != nil {
+		return CreateInviteResult{}, err
+	}
+
+	expiresAt := now.Add(ttl)
+	invites := pgIdent(s.schema, "invites")
+
+	_, err = s.pool.Exec(ctx,
+		`INSERT INTO `+invites+` (
+		     id, token_hash, created_by, created_at, expires_at
+		   ) VALUES ($1, $2, $3, $4, $5)`,
+		inviteID, tokenHash, pgTrimPtr(in.CreatedBy), now, expiresAt,
+	)
+	if err != nil {
+		if field, ok := pgClassifyUniqueViolation(err); ok {
+			return CreateInviteResult{}, ConflictError{Op: op, Field: field}
+		}
+		return CreateInviteResult{}, err
+	}
+
+	out := Invite{
+		ID:        inviteID,
+		CreatedBy: pgTrimPtr(in.CreatedBy),
+		CreatedAt: now,
+		ExpiresAt: expiresAt,
+	}
+
+	return CreateInviteResult{Invite: out, Token: tokenPlain}, nil
+}
+
+// ConsumeInviteAndCreateUser consumes an invite and creates a user + initial session atomically.
+func (s *PostgresStore) ConsumeInviteAndCreateUser(ctx context.Context, in ConsumeInviteInput) (ConsumeInviteResult, error) {
+	const op = "identity.ConsumeInvite"
+
+	if s == nil || s.pool == nil {
+		return ConsumeInviteResult{}, OpError{Op: op, Kind: ErrInvalidInput, Msg: "nil store"}
+	}
+	if err := ctx.Err(); err != nil {
+		return ConsumeInviteResult{}, err
+	}
+
+	token := strings.TrimSpace(in.Token)
+
+	now := in.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.ReadCommitted,
+		AccessMode: pgx.ReadWrite,
+	})
+	if err != nil {
+		return ConsumeInviteResult{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Lock invite row to ensure single-use (if provided).
+	var invite Invite
+	if token != "" {
+		var err error
+		invite, err = s.lockInviteByToken(ctx, tx, token)
+		if err != nil {
+			return ConsumeInviteResult{}, err
+		}
+		if invite.ConsumedAt != nil || invite.ConsumedBy != nil {
+			return ConsumeInviteResult{}, ErrNotActive
+		}
+		if !invite.ExpiresAt.After(now) {
+			return ConsumeInviteResult{}, ErrNotActive
+		}
+	}
+
+	// Create user + credentials.
+	user, err := s.insertUserAndCredsTx(ctx, tx, op, CreateUserInput{
+		Username: in.Username,
+		Email:    in.Email,
+		Password: in.Password,
+		Now:      now,
+	}, now)
+	if err != nil {
+		return ConsumeInviteResult{}, err
+	}
+
+	// Create session row.
+	refreshPlain, session, err := s.insertSessionTx(ctx, tx, user.ID, in, now)
+	if err != nil {
+		return ConsumeInviteResult{}, err
+	}
+
+	// Mark invite consumed when present.
+	if invite.ID != "" {
+		invites := pgIdent(s.schema, "invites")
+		_, err = tx.Exec(ctx,
+			`UPDATE `+invites+`
+			    SET consumed_at = $1,
+			        consumed_by = $2
+			  WHERE id = $3`,
+			now, user.ID, invite.ID,
+		)
+		if err != nil {
+			return ConsumeInviteResult{}, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return ConsumeInviteResult{}, err
+	}
+
+	return ConsumeInviteResult{
+		User:         user,
+		Session:      session,
+		RefreshToken: refreshPlain,
+		Invite:       invite,
+	}, nil
 }
 
 // RotateRefreshToken rotates the refresh token for an active session.
@@ -628,6 +838,187 @@ func (s *PostgresStore) GetSessionByRefreshToken(ctx context.Context, refreshTok
 
 // ---- helpers ----
 
+func (s *PostgresStore) insertUserAndCredsTx(ctx context.Context, tx pgx.Tx, op string, in CreateUserInput, now time.Time) (User, error) {
+	username := pgTrimPtr(in.Username)
+	email := pgTrimPtr(in.Email)
+
+	if username == nil && email == nil {
+		return User{}, pgInvalid(op, "username or email is required")
+	}
+	if strings.TrimSpace(in.Password) == "" {
+		return User{}, pgInvalid(op, "password is required")
+	}
+
+	// Normalize identity fields.
+	var usernameNorm *string
+	if username != nil {
+		n := NormalizeUsername(*username)
+		usernameNorm = &n
+	}
+	var emailNorm *string
+	if email != nil {
+		n := NormalizeEmail(*email)
+		emailNorm = &n
+	}
+
+	// Hash password.
+	pwHash, err := HashPassword(in.Password, DefaultArgon2idParams())
+	if err != nil {
+		return User{}, pgInvalid(op, err.Error())
+	}
+
+	userID, err := NewULID(now)
+	if err != nil {
+		return User{}, err
+	}
+
+	users := pgIdent(s.schema, "users")
+	creds := pgIdent(s.schema, "user_credentials")
+
+	_, err = tx.Exec(ctx,
+		`INSERT INTO `+users+` (
+		     id, username, username_norm, email, email_norm, created_at
+		   ) VALUES ($1, $2, $3, $4, $5, $6)`,
+		userID,
+		username,
+		usernameNorm,
+		email,
+		emailNorm,
+		now,
+	)
+	if err != nil {
+		if field, ok := pgClassifyUniqueViolation(err); ok {
+			return User{}, ConflictError{Op: op, Field: field}
+		}
+		return User{}, err
+	}
+
+	_, err = tx.Exec(ctx,
+		`INSERT INTO `+creds+` (user_id, password_hash, created_at, updated_at)
+		 VALUES ($1, $2, $3, $3)`,
+		userID, pwHash, now,
+	)
+	if err != nil {
+		// If FK fails here, it indicates programming/schema inconsistency.
+		return User{}, err
+	}
+
+	return User{
+		ID:           userID,
+		Username:     username,
+		UsernameNorm: usernameNorm,
+		Email:        email,
+		EmailNorm:    emailNorm,
+		CreatedAt:    now,
+	}, nil
+}
+
+func (s *PostgresStore) insertSessionTx(ctx context.Context, tx pgx.Tx, userID string, in ConsumeInviteInput, now time.Time) (string, Session, error) {
+	ttl := in.SessionTTL
+	if ttl <= 0 {
+		ttl = defaultSessionTTL
+	}
+	if ttl > maxSessionTTL {
+		ttl = maxSessionTTL
+	}
+
+	platform := strings.ToLower(strings.TrimSpace(in.Platform))
+	switch platform {
+	case "web", "ios", "android", "desktop", "unknown":
+	default:
+		platform = "unknown"
+	}
+
+	sessionID, err := NewULID(now)
+	if err != nil {
+		return "", Session{}, err
+	}
+
+	plain, err := NewOpaqueToken(32)
+	if err != nil {
+		return "", Session{}, err
+	}
+	hash := HashRefreshTokenHex(plain)
+	expiresAt := now.Add(ttl)
+
+	var ipVal any
+	if in.IP != nil && *in.IP != nil {
+		ipVal = (*in.IP).String()
+	}
+
+	sessions := pgIdent(s.schema, "sessions")
+	_, err = tx.Exec(ctx,
+		`INSERT INTO `+sessions+` (
+		     id, user_id, refresh_token_hash, created_at, last_used_at, expires_at, platform, user_agent, ip
+		   ) VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8)`,
+		sessionID,
+		userID,
+		hash,
+		now,
+		expiresAt,
+		platform,
+		pgTrimPtr(in.UserAgent),
+		ipVal,
+	)
+	if err != nil {
+		if field, ok := pgClassifyUniqueViolation(err); ok {
+			return "", Session{}, ConflictError{Op: "identity.CreateSession", Field: field}
+		}
+		return "", Session{}, err
+	}
+
+	var ipOut *net.IP
+	if in.IP != nil && *in.IP != nil {
+		parsed := net.ParseIP((*in.IP).String())
+		if parsed != nil {
+			ipOut = &parsed
+		}
+	}
+
+	lu := now
+	out := Session{
+		ID:               sessionID,
+		UserID:           userID,
+		RefreshTokenHash: hash,
+		CreatedAt:        now,
+		LastUsedAt:       &lu,
+		ExpiresAt:        expiresAt,
+		Platform:         platform,
+		UserAgent:        pgTrimPtr(in.UserAgent),
+		IP:               ipOut,
+	}
+
+	return plain, out, nil
+}
+
+func (s *PostgresStore) lockInviteByToken(ctx context.Context, tx pgx.Tx, tokenPlain string) (Invite, error) {
+	invites := pgIdent(s.schema, "invites")
+	tokenHash := HashRefreshTokenHex(tokenPlain)
+
+	var out Invite
+	err := tx.QueryRow(ctx,
+		`SELECT id, created_by, created_at, expires_at, consumed_at, consumed_by
+		   FROM `+invites+`
+		  WHERE token_hash = $1
+		  FOR UPDATE`,
+		tokenHash,
+	).Scan(
+		&out.ID,
+		&out.CreatedBy,
+		&out.CreatedAt,
+		&out.ExpiresAt,
+		&out.ConsumedAt,
+		&out.ConsumedBy,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Invite{}, ErrNotFound
+		}
+		return Invite{}, err
+	}
+	return out, nil
+}
+
 // ctEqHex64 compares two expected 64-char hex strings in constant time.
 // English comment:
 // - Rejects if either length != 64 to keep timing stable (and avoid oracle by length).
@@ -694,6 +1085,8 @@ func pgClassifyUniqueViolation(err error) (field string, ok bool) {
 		return "email", true
 	case "uq_sessions_refresh_token_hash":
 		return "refresh_token", true
+	case "uq_invites_token_hash":
+		return "invite_token", true
 	default:
 		switch {
 		case strings.Contains(c, "username"):

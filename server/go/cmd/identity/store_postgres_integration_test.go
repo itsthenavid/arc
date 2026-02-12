@@ -1,6 +1,3 @@
-//go:build integration
-// +build integration
-
 package identity
 
 import (
@@ -281,6 +278,72 @@ func TestPostgresStore_RotateRefreshToken_WrongToken_ReturnsNotActive(t *testing
 	}
 }
 
+func TestPostgresStore_InviteConsume_Succeeds_ThenRejectsReuse(t *testing.T) {
+	t.Parallel()
+
+	pool := mustOpenTestPool(t)
+	defer pool.Close()
+
+	schema := mustCreateTestSchema(t, pool)
+	t.Cleanup(func() { mustDropSchema(t, pool, schema) })
+	mustApplyIdentitySchema(t, pool, schema)
+
+	s := mustNewIdentityStore(t, pool, schema)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	inv, err := s.CreateInvite(ctx, CreateInviteInput{
+		CreatedBy: nil,
+		TTL:       24 * time.Hour,
+		Now:       time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	if inv.Token == "" || inv.Invite.ID == "" {
+		t.Fatalf("expected invite token and id")
+	}
+
+	u := "invite-user-" + strings.ToLower(mustNewULIDLike(t))
+	out, err := s.ConsumeInviteAndCreateUser(ctx, ConsumeInviteInput{
+		Token:      inv.Token,
+		Username:   &u,
+		Email:      nil,
+		Password:   "very-strong-password-8",
+		Now:        time.Now().UTC(),
+		SessionTTL: 24 * time.Hour,
+		Platform:   "web",
+		UserAgent:  nil,
+		IP:         nil,
+	})
+	if err != nil {
+		t.Fatalf("consume invite: %v", err)
+	}
+	if out.User.ID == "" || out.Session.ID == "" || out.RefreshToken == "" {
+		t.Fatalf("expected user, session, refresh token")
+	}
+	if out.Invite.ID != inv.Invite.ID {
+		t.Fatalf("expected invite id %q, got %q", inv.Invite.ID, out.Invite.ID)
+	}
+
+	// Reuse should fail.
+	_, err = s.ConsumeInviteAndCreateUser(ctx, ConsumeInviteInput{
+		Token:      inv.Token,
+		Username:   &u,
+		Email:      nil,
+		Password:   "very-strong-password-9",
+		Now:        time.Now().UTC(),
+		SessionTTL: 24 * time.Hour,
+		Platform:   "web",
+		UserAgent:  nil,
+		IP:         nil,
+	})
+	if err == nil || !errors.Is(err, ErrNotActive) {
+		t.Fatalf("expected ErrNotActive on invite reuse, got: %v", err)
+	}
+}
+
 func TestPostgresStore_RotateRefreshToken_ExpiredSession_ReturnsNotActive(t *testing.T) {
 	t.Parallel()
 
@@ -473,6 +536,7 @@ func mustApplyIdentitySchema(t *testing.T, pool *pgxpool.Pool, schema string) {
 	users := pgIdent(schema, "users")
 	creds := pgIdent(schema, "user_credentials")
 	sessions := pgIdent(schema, "sessions")
+	invites := pgIdent(schema, "invites")
 
 	schemaSQL := fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s (
@@ -523,6 +587,20 @@ CREATE TABLE IF NOT EXISTS %s (
   CONSTRAINT chk_sessions_replaced_not_self CHECK (replaced_by_session_id IS NULL OR replaced_by_session_id <> id)
 );
 
+CREATE TABLE IF NOT EXISTS %s (
+  id TEXT PRIMARY KEY,
+  token_hash TEXT NOT NULL,
+  created_by TEXT NULL REFERENCES %s(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at TIMESTAMPTZ NOT NULL,
+  consumed_at TIMESTAMPTZ NULL,
+  consumed_by TEXT NULL REFERENCES %s(id) ON DELETE SET NULL,
+  CONSTRAINT chk_invites_id_ulid_len CHECK (char_length(id) = 26),
+  CONSTRAINT chk_invites_token_hash_len CHECK (char_length(token_hash) = 64)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_invites_token_hash ON %s (token_hash);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_user_id
   ON %s (user_id);
 
@@ -531,7 +609,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_expires_at
 
 CREATE INDEX IF NOT EXISTS idx_sessions_replaced_by
   ON %s (replaced_by_session_id);
-`, users, creds, users, sessions, users, sessions, sessions, sessions, sessions)
+`, users, creds, users, sessions, users, sessions, invites, users, users, invites, sessions, sessions, sessions)
 
 	if _, err := pool.Exec(ctx, schemaSQL); err != nil {
 		t.Fatalf("apply schema: %v", err)
