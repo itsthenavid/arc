@@ -1,4 +1,4 @@
-package api
+package authapi
 
 import (
 	"arc/cmd/identity"

@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"time"
 
-	"arc/cmd/internal/auth/api"
+	authapi "arc/cmd/internal/auth/api"
 	"arc/cmd/internal/auth/session"
 	"arc/cmd/internal/realtime"
 
@@ -39,7 +39,7 @@ type App struct {
 
 	ws *realtime.WSGateway
 
-	auth *api.Handler
+	auth *authapi.Handler
 }
 
 // New constructs a fully wired App instance from config and logger.
@@ -53,7 +53,7 @@ func New(cfg Config, log Logger) (*App, error) {
 		return nil, err
 	}
 
-	var authHandler *api.Handler
+	var authHandler *authapi.Handler
 	var sessionSvc *session.Service
 	var memberStore realtime.MembershipStore
 
@@ -62,8 +62,8 @@ func New(cfg Config, log Logger) (*App, error) {
 		if err != nil {
 			return nil, err
 		}
-		authCfg := api.LoadConfigFromEnv()
-		authHandler, err = api.NewHandler(log, dbPool, authCfg, sessCfg, dbEnabled)
+		authCfg := authapi.LoadConfigFromEnv()
+		authHandler, err = authapi.NewHandler(log, dbPool, authCfg, sessCfg, dbEnabled)
 		if err != nil {
 			return nil, err
 		}
