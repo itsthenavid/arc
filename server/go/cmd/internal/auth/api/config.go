@@ -9,13 +9,15 @@ import (
 
 // Config controls auth API behavior and security defaults.
 type Config struct {
-	InviteOnly    bool
-	InviteTTL     time.Duration
-	InviteMaxTTL  time.Duration
-	TrustProxy    bool
-	MaxBodyBytes  int64
-	LoginIPMax    int
-	LoginIPWindow time.Duration
+	InviteOnly       bool
+	InviteTTL        time.Duration
+	InviteMaxTTL     time.Duration
+	InviteMaxUses    int
+	InviteMaxUsesMax int
+	TrustProxy       bool
+	MaxBodyBytes     int64
+	LoginIPMax       int
+	LoginIPWindow    time.Duration
 
 	LoginUserMax    int
 	LoginUserWindow time.Duration
@@ -34,6 +36,8 @@ func LoadConfigFromEnv() Config {
 		InviteOnly:             envBool("ARC_AUTH_INVITE_ONLY", true),
 		InviteTTL:              envDuration("ARC_AUTH_INVITE_TTL", 7*24*time.Hour),
 		InviteMaxTTL:           envDuration("ARC_AUTH_INVITE_TTL_MAX", 30*24*time.Hour),
+		InviteMaxUses:          envInt("ARC_AUTH_INVITE_MAX_USES", 1),
+		InviteMaxUsesMax:       envInt("ARC_AUTH_INVITE_MAX_USES_MAX", 50),
 		TrustProxy:             envBool("ARC_AUTH_TRUST_PROXY", false),
 		MaxBodyBytes:           envInt64("ARC_AUTH_MAX_BODY_BYTES", 1<<20), // 1 MiB
 		LoginIPMax:             envInt("ARC_AUTH_LOGIN_IP_MAX", 20),
@@ -57,6 +61,15 @@ func LoadConfigFromEnv() Config {
 	}
 	if cfg.InviteTTL > cfg.InviteMaxTTL {
 		cfg.InviteTTL = cfg.InviteMaxTTL
+	}
+	if cfg.InviteMaxUses <= 0 {
+		cfg.InviteMaxUses = 1
+	}
+	if cfg.InviteMaxUsesMax <= 0 {
+		cfg.InviteMaxUsesMax = 50
+	}
+	if cfg.InviteMaxUses > cfg.InviteMaxUsesMax {
+		cfg.InviteMaxUses = cfg.InviteMaxUsesMax
 	}
 
 	if cfg.MaxBodyBytes <= 0 {

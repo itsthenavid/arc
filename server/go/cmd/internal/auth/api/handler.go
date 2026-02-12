@@ -349,6 +349,18 @@ func (h *Handler) handleInviteCreate(w http.ResponseWriter, r *http.Request) {
 	if ttl <= 0 {
 		ttl = h.cfg.InviteTTL
 	}
+	maxUses := h.cfg.InviteMaxUses
+	if req.MaxUses > 0 {
+		maxUses = req.MaxUses
+	}
+	if maxUses > h.cfg.InviteMaxUsesMax {
+		maxUses = h.cfg.InviteMaxUsesMax
+	}
+	note := trimPtr(req.Note)
+	if note != nil && len(*note) > 512 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "note is too long")
+		return
+	}
 
 	ctx := r.Context()
 	now := time.Now().UTC()
@@ -356,6 +368,8 @@ func (h *Handler) handleInviteCreate(w http.ResponseWriter, r *http.Request) {
 	res, err := h.identity.CreateInvite(ctx, identity.CreateInviteInput{
 		CreatedBy: &claims.UserID,
 		TTL:       ttl,
+		MaxUses:   maxUses,
+		Note:      note,
 		Now:       now,
 	})
 	if err != nil {

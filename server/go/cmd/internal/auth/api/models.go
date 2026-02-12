@@ -17,7 +17,9 @@ type refreshRequest struct {
 }
 
 type inviteCreateRequest struct {
-	ExpiresInSeconds int64 `json:"expires_in_seconds"`
+	ExpiresInSeconds int64   `json:"expires_in_seconds"`
+	MaxUses          int     `json:"max_uses"`
+	Note             *string `json:"note"`
 }
 
 type inviteConsumeRequest struct {
