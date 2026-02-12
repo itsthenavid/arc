@@ -14,6 +14,7 @@ import (
 // - Close is idempotent.
 type Client struct {
 	SessionID string
+	UserID    string
 	Send      chan v1.Envelope
 
 	done      chan struct{}
@@ -21,12 +22,13 @@ type Client struct {
 }
 
 // NewClient constructs a Client with a bounded send queue.
-func NewClient(sessionID string, sendQueueSize int) *Client {
+func NewClient(userID, sessionID string, sendQueueSize int) *Client {
 	if sendQueueSize <= 0 {
 		sendQueueSize = 64
 	}
 	return &Client{
 		SessionID: sessionID,
+		UserID:    userID,
 		Send:      make(chan v1.Envelope, sendQueueSize),
 		done:      make(chan struct{}),
 	}

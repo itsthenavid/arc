@@ -18,6 +18,8 @@ import (
 
 	v1 "arc/shared/contracts/realtime/v1"
 
+	"arc/cmd/internal/auth/session"
+
 	"github.com/coder/websocket"
 )
 
@@ -49,6 +51,11 @@ type WSGateway struct {
 	hub   *Hub
 	store MessageStore
 
+	auth          *session.Service
+	requireAuth   bool
+	members       MembershipStore
+	requireMember bool
+
 	devInsecure    bool
 	originRequired bool
 	allowedOrigins []string
@@ -66,7 +73,7 @@ type WSGateway struct {
 
 // NewWSGateway constructs a gateway with secure defaults.
 // When hub/store are nil, it falls back to in-memory implementations for dev.
-func NewWSGateway(log *slog.Logger, hub *Hub, store MessageStore) *WSGateway {
+func NewWSGateway(log *slog.Logger, hub *Hub, store MessageStore, auth *session.Service, members MembershipStore) *WSGateway {
 	if log == nil {
 		log = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	}
@@ -77,10 +84,16 @@ func NewWSGateway(log *slog.Logger, hub *Hub, store MessageStore) *WSGateway {
 		store = NewInMemoryStore()
 	}
 
-	g := &WSGateway{log: log, hub: hub, store: store}
+	g := &WSGateway{log: log, hub: hub, store: store, auth: auth, members: members}
 
 	// Dev-only escape hatch.
 	g.devInsecure = envBoolWS("ARC_WS_DEV_INSECURE", false)
+	g.requireAuth = envBoolWS("ARC_WS_REQUIRE_AUTH", auth != nil)
+	g.requireMember = envBoolWS("ARC_WS_REQUIRE_MEMBERSHIP", members != nil)
+	if g.requireMember {
+		// Membership checks require authenticated user IDs.
+		g.requireAuth = true
+	}
 
 	g.originRequired = envBoolWS("ARC_WS_ORIGIN_REQUIRED", wsDefaultOriginRequired)
 	g.allowedOrigins = envCSVWS("ARC_WS_ALLOWED_ORIGINS", wsDefaultAllowedOrigins)
@@ -115,6 +128,32 @@ func (g *WSGateway) HandleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var (
+		userID    string
+		sessionID string
+	)
+
+	if g.requireAuth && !g.devInsecure {
+		if g.auth == nil {
+			http.Error(w, "auth not configured", http.StatusInternalServerError)
+			return
+		}
+		token := bearerToken(r)
+		if token == "" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		claims, err := g.auth.ValidateAccessToken(r.Context(), token, time.Now().UTC())
+		if err != nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		userID = claims.UserID
+		sessionID = claims.SessionID
+		// Update session last_used_at on successful auth.
+		_ = g.auth.TouchSession(r.Context(), time.Now().UTC(), sessionID)
+	}
+
 	// English comment:
 	// Origin enforcement is fully handled by enforceOrigin() as the single source of truth.
 	// We intentionally do NOT use AcceptOptions.OriginPatterns to avoid library-specific semantics mismatch.
@@ -137,15 +176,18 @@ func (g *WSGateway) HandleWS(w http.ResponseWriter, r *http.Request) {
 	conn.SetReadLimit(maxFrameBytes)
 
 	now := time.Now().UTC()
-	sessionID, err := NewSessionID(now)
-	if err != nil {
-		g.log.Error("ws.session_id.fail", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		_ = conn.Close(websocket.StatusInternalError, "internal error")
-		return
+	if sessionID == "" {
+		var err error
+		sessionID, err = NewSessionID(now)
+		if err != nil {
+			g.log.Error("ws.session_id.fail", "err", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			_ = conn.Close(websocket.StatusInternalError, "internal error")
+			return
+		}
 	}
 
-	client := NewClient(sessionID, g.sendQueueSize)
+	client := NewClient(userID, sessionID, g.sendQueueSize)
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -347,6 +389,22 @@ func (g *WSGateway) onJoin(ctx context.Context, client *Client, env v1.Envelope)
 		return nil, errors.New("missing conversation_id")
 	}
 
+	if g.requireMember {
+		if client.UserID == "" {
+			return nil, errors.New("unauthorized")
+		}
+		if g.members == nil {
+			return nil, errors.New("membership store not configured")
+		}
+		ok, err := g.members.IsMember(ctx, client.UserID, convID)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, errors.New("not a member of conversation_id")
+		}
+	}
+
 	conv := g.hub.GetOrCreateConversation(convID)
 	conv.Join(client)
 
@@ -375,6 +433,22 @@ func (g *WSGateway) onMessageSend(ctx context.Context, client *Client, conv *Con
 	}
 	if strings.TrimSpace(p.ClientMsgID) == "" {
 		return errors.New("missing client_msg_id")
+	}
+
+	if g.requireMember {
+		if client.UserID == "" {
+			return errors.New("unauthorized")
+		}
+		if g.members == nil {
+			return errors.New("membership store not configured")
+		}
+		ok, err := g.members.IsMember(ctx, client.UserID, conv.ID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("not a member of conversation_id")
+		}
 	}
 
 	text := strings.TrimSpace(p.Text)
@@ -440,6 +514,21 @@ func (g *WSGateway) onHistoryFetch(ctx context.Context, client *Client, conv *Co
 	}
 	if convID != conv.ID {
 		return errors.New("not a member of conversation_id")
+	}
+	if g.requireMember {
+		if client.UserID == "" {
+			return errors.New("unauthorized")
+		}
+		if g.members == nil {
+			return errors.New("membership store not configured")
+		}
+		ok, err := g.members.IsMember(ctx, client.UserID, convID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("not a member of conversation_id")
+		}
 	}
 
 	limit := p.Limit
@@ -699,4 +788,19 @@ func envCSVWS(key string, def string) []string {
 		}
 	}
 	return out
+}
+
+func bearerToken(r *http.Request) string {
+	raw := strings.TrimSpace(r.Header.Get("Authorization"))
+	if raw == "" {
+		return ""
+	}
+	parts := strings.SplitN(raw, " ", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	if !strings.EqualFold(parts[0], "Bearer") {
+		return ""
+	}
+	return strings.TrimSpace(parts[1])
 }
