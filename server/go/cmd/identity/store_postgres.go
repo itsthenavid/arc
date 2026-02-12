@@ -941,9 +941,18 @@ func (s *PostgresStore) insertSessionTx(ctx context.Context, tx pgx.Tx, userID s
 	hash := HashRefreshTokenHex(plain)
 	expiresAt := now.Add(ttl)
 
-	var ipVal any
-	if in.IP != nil && *in.IP != nil {
-		ipVal = (*in.IP).String()
+	var (
+		ipVal any
+		ipStr string
+	)
+	if in.IP != nil {
+		ip := *in.IP
+		if len(ip) > 0 {
+			ipStr = ip.String()
+			if ipStr != "" && ipStr != "<nil>" {
+				ipVal = ipStr
+			}
+		}
 	}
 
 	sessions := pgIdent(s.schema, "sessions")
@@ -968,8 +977,8 @@ func (s *PostgresStore) insertSessionTx(ctx context.Context, tx pgx.Tx, userID s
 	}
 
 	var ipOut *net.IP
-	if in.IP != nil && *in.IP != nil {
-		parsed := net.ParseIP((*in.IP).String())
+	if ipStr != "" && ipStr != "<nil>" {
+		parsed := net.ParseIP(ipStr)
 		if parsed != nil {
 			ipOut = &parsed
 		}
