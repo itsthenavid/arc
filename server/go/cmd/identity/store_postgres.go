@@ -371,6 +371,14 @@ func (s *PostgresStore) CreateInvite(ctx context.Context, in CreateInviteInput) 
 	if ttl <= 0 {
 		ttl = 7 * 24 * time.Hour
 	}
+	maxUses := in.MaxUses
+	if maxUses <= 0 {
+		maxUses = 1
+	}
+	note := pgTrimPtr(in.Note)
+	if note != nil && len(*note) > 512 {
+		return CreateInviteResult{}, pgInvalid(op, "note too long")
+	}
 
 	tokenPlain, err := NewOpaqueToken(32)
 	if err != nil {
@@ -388,9 +396,9 @@ func (s *PostgresStore) CreateInvite(ctx context.Context, in CreateInviteInput) 
 
 	_, err = s.pool.Exec(ctx,
 		`INSERT INTO `+invites+` (
-		     id, token_hash, created_by, created_at, expires_at
-		   ) VALUES ($1, $2, $3, $4, $5)`,
-		inviteID, tokenHash, pgTrimPtr(in.CreatedBy), now, expiresAt,
+		     id, token_hash, created_by, created_at, expires_at, max_uses, used_count, note
+		   ) VALUES ($1, $2, $3, $4, $5, $6, 0, $7)`,
+		inviteID, tokenHash, pgTrimPtr(in.CreatedBy), now, expiresAt, maxUses, note,
 	)
 	if err != nil {
 		if field, ok := pgClassifyUniqueViolation(err); ok {
@@ -404,6 +412,9 @@ func (s *PostgresStore) CreateInvite(ctx context.Context, in CreateInviteInput) 
 		CreatedBy: pgTrimPtr(in.CreatedBy),
 		CreatedAt: now,
 		ExpiresAt: expiresAt,
+		MaxUses:   maxUses,
+		UsedCount: 0,
+		Note:      note,
 	}
 
 	return CreateInviteResult{Invite: out, Token: tokenPlain}, nil
@@ -444,10 +455,13 @@ func (s *PostgresStore) ConsumeInviteAndCreateUser(ctx context.Context, in Consu
 		if err != nil {
 			return ConsumeInviteResult{}, err
 		}
-		if invite.ConsumedAt != nil || invite.ConsumedBy != nil {
+		if invite.RevokedAt != nil {
 			return ConsumeInviteResult{}, ErrNotActive
 		}
 		if !invite.ExpiresAt.After(now) {
+			return ConsumeInviteResult{}, ErrNotActive
+		}
+		if invite.MaxUses > 0 && invite.UsedCount >= invite.MaxUses {
 			return ConsumeInviteResult{}, ErrNotActive
 		}
 	}
@@ -472,16 +486,24 @@ func (s *PostgresStore) ConsumeInviteAndCreateUser(ctx context.Context, in Consu
 	// Mark invite consumed when present.
 	if invite.ID != "" {
 		invites := pgIdent(s.schema, "invites")
-		_, err = tx.Exec(ctx,
+		tag, err := tx.Exec(ctx,
 			`UPDATE `+invites+`
-			    SET consumed_at = $1,
+			    SET used_count = used_count + 1,
+			        consumed_at = $1,
 			        consumed_by = $2
-			  WHERE id = $3`,
+			  WHERE id = $3
+			    AND (max_uses <= 0 OR used_count < max_uses)`,
 			now, user.ID, invite.ID,
 		)
 		if err != nil {
 			return ConsumeInviteResult{}, err
 		}
+		if tag.RowsAffected() == 0 {
+			return ConsumeInviteResult{}, ErrNotActive
+		}
+		invite.UsedCount++
+		invite.ConsumedAt = &now
+		invite.ConsumedBy = &user.ID
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -1006,7 +1028,7 @@ func (s *PostgresStore) lockInviteByToken(ctx context.Context, tx pgx.Tx, tokenP
 
 	var out Invite
 	err := tx.QueryRow(ctx,
-		`SELECT id, created_by, created_at, expires_at, consumed_at, consumed_by
+		`SELECT id, created_by, created_at, expires_at, max_uses, used_count, revoked_at, note, consumed_at, consumed_by
 		   FROM `+invites+`
 		  WHERE token_hash = $1
 		  FOR UPDATE`,
@@ -1016,6 +1038,10 @@ func (s *PostgresStore) lockInviteByToken(ctx context.Context, tx pgx.Tx, tokenP
 		&out.CreatedBy,
 		&out.CreatedAt,
 		&out.ExpiresAt,
+		&out.MaxUses,
+		&out.UsedCount,
+		&out.RevokedAt,
+		&out.Note,
 		&out.ConsumedAt,
 		&out.ConsumedBy,
 	)

@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -293,6 +294,7 @@ func TestPostgresStore_InviteConsume_Succeeds_ThenRejectsReuse(t *testing.T) {
 	inv, err := s.CreateInvite(ctx, CreateInviteInput{
 		CreatedBy: nil,
 		TTL:       24 * time.Hour,
+		MaxUses:   1,
 		Now:       time.Now().UTC(),
 	})
 	if err != nil {
@@ -323,6 +325,9 @@ func TestPostgresStore_InviteConsume_Succeeds_ThenRejectsReuse(t *testing.T) {
 	if out.Invite.ID != inv.Invite.ID {
 		t.Fatalf("expected invite id %q, got %q", inv.Invite.ID, out.Invite.ID)
 	}
+	if out.Invite.UsedCount != 1 {
+		t.Fatalf("expected used_count=1, got %d", out.Invite.UsedCount)
+	}
 
 	// Reuse should fail.
 	_, err = s.ConsumeInviteAndCreateUser(ctx, ConsumeInviteInput{
@@ -338,6 +343,203 @@ func TestPostgresStore_InviteConsume_Succeeds_ThenRejectsReuse(t *testing.T) {
 	})
 	if err == nil || !errors.Is(err, ErrNotActive) {
 		t.Fatalf("expected ErrNotActive on invite reuse, got: %v", err)
+	}
+}
+
+func TestPostgresStore_InviteConsume_MaxUses_AllowsMultiple(t *testing.T) {
+	t.Parallel()
+
+	pool := mustOpenTestPool(t)
+	defer pool.Close()
+
+	schema := mustCreateTestSchema(t, pool)
+	t.Cleanup(func() { mustDropSchema(t, pool, schema) })
+	mustApplyIdentitySchema(t, pool, schema)
+
+	s := mustNewIdentityStore(t, pool, schema)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	maxUses := 2
+	inv, err := s.CreateInvite(ctx, CreateInviteInput{
+		CreatedBy: nil,
+		TTL:       24 * time.Hour,
+		MaxUses:   maxUses,
+		Now:       time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+
+	for i := 0; i < maxUses; i++ {
+		u := fmt.Sprintf("invite-user-%d-%s", i, strings.ToLower(mustNewULIDLike(t)))
+		out, err := s.ConsumeInviteAndCreateUser(ctx, ConsumeInviteInput{
+			Token:      inv.Token,
+			Username:   &u,
+			Email:      nil,
+			Password:   "very-strong-password-8",
+			Now:        time.Now().UTC(),
+			SessionTTL: 24 * time.Hour,
+			Platform:   "web",
+		})
+		if err != nil {
+			t.Fatalf("consume invite %d: %v", i, err)
+		}
+		if out.Invite.UsedCount != i+1 {
+			t.Fatalf("expected used_count=%d, got %d", i+1, out.Invite.UsedCount)
+		}
+	}
+
+	u := "invite-user-over-" + strings.ToLower(mustNewULIDLike(t))
+	_, err = s.ConsumeInviteAndCreateUser(ctx, ConsumeInviteInput{
+		Token:      inv.Token,
+		Username:   &u,
+		Email:      nil,
+		Password:   "very-strong-password-9",
+		Now:        time.Now().UTC(),
+		SessionTTL: 24 * time.Hour,
+		Platform:   "web",
+	})
+	if err == nil || !errors.Is(err, ErrNotActive) {
+		t.Fatalf("expected ErrNotActive after max uses, got: %v", err)
+	}
+}
+
+func TestPostgresStore_InviteConsume_RevokedOrExpired(t *testing.T) {
+	t.Parallel()
+
+	pool := mustOpenTestPool(t)
+	defer pool.Close()
+
+	schema := mustCreateTestSchema(t, pool)
+	t.Cleanup(func() { mustDropSchema(t, pool, schema) })
+	mustApplyIdentitySchema(t, pool, schema)
+
+	s := mustNewIdentityStore(t, pool, schema)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	// Expired invite.
+	expired, err := s.CreateInvite(ctx, CreateInviteInput{
+		CreatedBy: nil,
+		TTL:       1 * time.Hour,
+		MaxUses:   1,
+		Now:       time.Now().UTC().Add(-2 * time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("create expired invite: %v", err)
+	}
+
+	u1 := "invite-user-exp-" + strings.ToLower(mustNewULIDLike(t))
+	_, err = s.ConsumeInviteAndCreateUser(ctx, ConsumeInviteInput{
+		Token:      expired.Token,
+		Username:   &u1,
+		Email:      nil,
+		Password:   "very-strong-password-1",
+		Now:        time.Now().UTC(),
+		SessionTTL: 24 * time.Hour,
+		Platform:   "web",
+	})
+	if err == nil || !errors.Is(err, ErrNotActive) {
+		t.Fatalf("expected ErrNotActive for expired invite, got: %v", err)
+	}
+
+	// Revoked invite.
+	revoked, err := s.CreateInvite(ctx, CreateInviteInput{
+		CreatedBy: nil,
+		TTL:       24 * time.Hour,
+		MaxUses:   1,
+		Now:       time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("create revoked invite: %v", err)
+	}
+
+	invites := pgIdent(schema, "invites")
+	if _, err := pool.Exec(ctx, `UPDATE `+invites+` SET revoked_at = $1 WHERE id = $2`, time.Now().UTC(), revoked.Invite.ID); err != nil {
+		t.Fatalf("revoke invite: %v", err)
+	}
+
+	u2 := "invite-user-rev-" + strings.ToLower(mustNewULIDLike(t))
+	_, err = s.ConsumeInviteAndCreateUser(ctx, ConsumeInviteInput{
+		Token:      revoked.Token,
+		Username:   &u2,
+		Email:      nil,
+		Password:   "very-strong-password-2",
+		Now:        time.Now().UTC(),
+		SessionTTL: 24 * time.Hour,
+		Platform:   "web",
+	})
+	if err == nil || !errors.Is(err, ErrNotActive) {
+		t.Fatalf("expected ErrNotActive for revoked invite, got: %v", err)
+	}
+}
+
+func TestPostgresStore_InviteConsume_Concurrent_MaxUses(t *testing.T) {
+	t.Parallel()
+
+	pool := mustOpenTestPool(t)
+	defer pool.Close()
+
+	schema := mustCreateTestSchema(t, pool)
+	t.Cleanup(func() { mustDropSchema(t, pool, schema) })
+	mustApplyIdentitySchema(t, pool, schema)
+
+	s := mustNewIdentityStore(t, pool, schema)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	maxUses := 2
+	inv, err := s.CreateInvite(ctx, CreateInviteInput{
+		CreatedBy: nil,
+		TTL:       24 * time.Hour,
+		MaxUses:   maxUses,
+		Now:       time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+
+	const attempts = 5
+	errs := make(chan error, attempts)
+	var wg sync.WaitGroup
+	wg.Add(attempts)
+	for i := 0; i < attempts; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			u := fmt.Sprintf("invite-user-conc-%d-%s", i, strings.ToLower(mustNewULIDLike(t)))
+			_, err := s.ConsumeInviteAndCreateUser(ctx, ConsumeInviteInput{
+				Token:      inv.Token,
+				Username:   &u,
+				Email:      nil,
+				Password:   "very-strong-password-3",
+				Now:        time.Now().UTC(),
+				SessionTTL: 24 * time.Hour,
+				Platform:   "web",
+			})
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	success := 0
+	for err := range errs {
+		if err == nil {
+			success++
+			continue
+		}
+		if errors.Is(err, ErrNotActive) {
+			continue
+		}
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if success != maxUses {
+		t.Fatalf("expected %d successful consumes, got %d", maxUses, success)
 	}
 }
 
@@ -593,10 +795,16 @@ CREATE TABLE IF NOT EXISTS %s (
   created_by TEXT NULL REFERENCES %s(id) ON DELETE SET NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   expires_at TIMESTAMPTZ NOT NULL,
+  max_uses INT NOT NULL DEFAULT 1,
+  used_count INT NOT NULL DEFAULT 0,
+  revoked_at TIMESTAMPTZ NULL,
+  note TEXT NULL,
   consumed_at TIMESTAMPTZ NULL,
   consumed_by TEXT NULL REFERENCES %s(id) ON DELETE SET NULL,
   CONSTRAINT chk_invites_id_ulid_len CHECK (char_length(id) = 26),
-  CONSTRAINT chk_invites_token_hash_len CHECK (char_length(token_hash) = 64)
+  CONSTRAINT chk_invites_token_hash_len CHECK (char_length(token_hash) = 64),
+  CONSTRAINT chk_invites_max_uses CHECK (max_uses >= 1),
+  CONSTRAINT chk_invites_used_count CHECK (used_count >= 0 AND used_count <= max_uses)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_invites_token_hash ON %s (token_hash);

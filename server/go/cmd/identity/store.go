@@ -54,6 +54,10 @@ type Invite struct {
 	CreatedBy  *string
 	CreatedAt  time.Time
 	ExpiresAt  time.Time
+	MaxUses    int
+	UsedCount  int
+	RevokedAt  *time.Time
+	Note       *string
 	ConsumedAt *time.Time
 	ConsumedBy *string
 }
@@ -94,6 +98,8 @@ type CreateSessionResult struct {
 type CreateInviteInput struct {
 	CreatedBy *string
 	TTL       time.Duration
+	MaxUses   int
+	Note      *string
 	Now       time.Time
 }
 
