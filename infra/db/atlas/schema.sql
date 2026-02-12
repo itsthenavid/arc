@@ -369,12 +369,26 @@ CREATE TABLE IF NOT EXISTS arc.invites (
     created_by TEXT NULL REFERENCES arc.users (id) ON DELETE SET NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     expires_at TIMESTAMPTZ NOT NULL,
+    max_uses INT NOT NULL DEFAULT 1,
+    used_count INT NOT NULL DEFAULT 0,
+    revoked_at TIMESTAMPTZ NULL,
+    note TEXT NULL,
     consumed_at TIMESTAMPTZ NULL,
     consumed_by TEXT NULL REFERENCES arc.users (id) ON DELETE SET NULL,
     CONSTRAINT chk_invites_id_ulid_len CHECK (char_length(id) = 26),
     CONSTRAINT chk_invites_token_hash_len CHECK (char_length(token_hash) = 64),
     CONSTRAINT chk_invites_expires_after_created CHECK (expires_at > created_at),
-    CONSTRAINT chk_invites_single_use CHECK (
+    CONSTRAINT chk_invites_max_uses CHECK (max_uses >= 1),
+    CONSTRAINT chk_invites_used_count CHECK (used_count >= 0 AND used_count <= max_uses),
+    CONSTRAINT chk_invites_revoked_after_created CHECK (
+        revoked_at IS NULL
+        OR revoked_at >= created_at
+    ),
+    CONSTRAINT chk_invites_note_len CHECK (
+        note IS NULL
+        OR char_length(note) <= 512
+    ),
+    CONSTRAINT chk_invites_consumed_at_after_created CHECK (
         consumed_at IS NULL
         OR consumed_at >= created_at
     ),
@@ -388,6 +402,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_invites_token_hash ON arc.invites (token_ha
 CREATE INDEX IF NOT EXISTS idx_invites_expires_at ON arc.invites (expires_at);
 
 CREATE INDEX IF NOT EXISTS idx_invites_consumed_at ON arc.invites (consumed_at);
+
+CREATE INDEX IF NOT EXISTS idx_invites_revoked_at ON arc.invites (revoked_at);
 
 -- =========================
 -- Membership (authoritative)
