@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"time"
 
+	"arc/cmd/internal/auth/api"
 	"arc/cmd/internal/realtime"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -16,6 +17,7 @@ func registerHTTP(
 	dbPool *pgxpool.Pool,
 	dbEnabled bool,
 	ws *realtime.WSGateway,
+	auth *api.Handler,
 ) {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -39,6 +41,10 @@ func registerHTTP(
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ready\n"))
 	})
+
+	if auth != nil {
+		auth.Register(mux)
+	}
 
 	mux.HandleFunc("/ws", ws.HandleWS)
 }

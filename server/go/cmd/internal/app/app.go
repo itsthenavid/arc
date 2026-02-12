@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"time"
 
+	"arc/cmd/internal/auth/api"
+	"arc/cmd/internal/auth/session"
 	"arc/cmd/internal/realtime"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -36,6 +38,8 @@ type App struct {
 	dbEnabled bool
 
 	ws *realtime.WSGateway
+
+	auth *api.Handler
 }
 
 // New constructs a fully wired App instance from config and logger.
@@ -49,7 +53,30 @@ func New(cfg Config, log Logger) (*App, error) {
 		return nil, err
 	}
 
-	ws := realtime.NewWSGateway(log, realtime.NewHub(log), msgStore)
+	var authHandler *api.Handler
+	var sessionSvc *session.Service
+	var memberStore realtime.MembershipStore
+
+	if dbEnabled {
+		sessCfg, err := session.LoadConfigFromEnv()
+		if err != nil {
+			return nil, err
+		}
+		authCfg := api.LoadConfigFromEnv()
+		authHandler, err = api.NewHandler(log, dbPool, authCfg, sessCfg, dbEnabled)
+		if err != nil {
+			return nil, err
+		}
+		sessionSvc = authHandler.SessionService()
+
+		members, err := realtime.NewPostgresMembershipStore(dbPool)
+		if err != nil {
+			return nil, err
+		}
+		memberStore = members
+	}
+
+	ws := realtime.NewWSGateway(log, realtime.NewHub(log), msgStore, sessionSvc, memberStore)
 
 	return &App{
 		cfg:       cfg,
@@ -58,6 +85,7 @@ func New(cfg Config, log Logger) (*App, error) {
 		dbPool:    dbPool,
 		dbEnabled: dbEnabled,
 		ws:        ws,
+		auth:      authHandler,
 	}, nil
 }
 
@@ -66,7 +94,7 @@ func (a *App) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 
 	// Use the canonical HTTP registration from http.go (so it is not "unused").
-	registerHTTP(mux, a.log, a.cfg, a.dbPool, a.dbEnabled, a.ws)
+	registerHTTP(mux, a.log, a.cfg, a.dbPool, a.dbEnabled, a.ws, a.auth)
 
 	srv := &http.Server{
 		Addr:              a.cfg.HTTPAddr,
