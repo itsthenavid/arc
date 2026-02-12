@@ -28,8 +28,8 @@ reuse detection, per-device revocation, and configurable TTL policy
   - `RevokeAll(userID)`
   - `ValidateAccessToken(token) -> claims`
 - Token formats (per ADR):
-  - Access token: JWT (short TTL) OR PASETO (preferred if ADR chose it)
-  - Refresh token: opaque random string, stored **hashed**
+  - Access token: PASETO v4.public (short TTL)
+  - Refresh token: opaque random string, stored **hashed** (HMAC-SHA256 when ARC_TOKEN_HMAC_KEY is set)
 - Rotation rules:
   - Every refresh rotates and invalidates previous
   - Reuse detection:

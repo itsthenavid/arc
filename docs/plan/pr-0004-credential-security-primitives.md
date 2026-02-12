@@ -6,7 +6,7 @@ with **configurable Argon2id** and stable interfaces.
 
 ### Scope
 **Go**
-- Package: `cmd/internal/security/password`
+- Package: `cmd/security/password`
   - `Hash(password) -> hash`
   - `Verify(hash, password) -> bool`
   - Parameter config via env:

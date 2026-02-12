@@ -75,11 +75,11 @@ Email verification, captcha, and abuse-prevention mechanisms are **explicitly su
 
 ### 3. Authentication & Session Strategy
 
-Arc uses a **hybrid token model** combining the strengths of JWTs and opaque sessions.
+Arc uses a **hybrid token model** combining the strengths of signed access tokens (PASETO) and opaque sessions.
 
 #### Tokens
 - **Access Token**
-  - Format: JWT
+  - Format: PASETO v4.public (Ed25519)
   - Lifetime: 15 minutes
   - Purpose: authorization and identity propagation (HTTP + WebSocket)
 - **Refresh Token**
@@ -194,7 +194,7 @@ Soft deletes are **not used**. Security and correctness take precedence.
 - Architecture suitable for both portfolio-grade review and real-world use
 
 ### Trade-offs
-- Increased implementation complexity compared to JWT-only systems
+- Increased implementation complexity compared to stateless-token-only systems
 - Requires careful testing around session rotation and revocation
 - Slightly higher database dependency for session validation
 
