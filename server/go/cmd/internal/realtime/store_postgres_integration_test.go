@@ -332,7 +332,8 @@ func mustApplySchema(t *testing.T, pool *pgxpool.Pool, schema string) {
 	schemaSQL := fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s (
   id         TEXT PRIMARY KEY,
-  kind       TEXT NOT NULL CHECK (kind IN ('direct', 'group')),
+  kind       TEXT NOT NULL CHECK (kind IN ('direct', 'group', 'room')),
+  visibility TEXT NOT NULL DEFAULT 'private' CHECK (visibility IN ('public', 'private')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

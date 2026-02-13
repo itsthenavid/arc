@@ -25,10 +25,43 @@ $$ LANGUAGE plpgsql;
 
 CREATE TABLE IF NOT EXISTS arc.conversations (
     id TEXT PRIMARY KEY,
-    kind TEXT NOT NULL CHECK (kind IN ('direct', 'group')),
+    kind TEXT NOT NULL,
+    visibility TEXT NOT NULL DEFAULT 'private',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT chk_conversations_id_nonempty CHECK (char_length(id) > 0)
 );
+
+-- PR-010: evolve conversation kind + visibility in an idempotent way for existing databases.
+ALTER TABLE arc.conversations
+    ADD COLUMN IF NOT EXISTS visibility TEXT;
+
+UPDATE arc.conversations
+SET visibility = 'private'
+WHERE visibility IS NULL;
+
+ALTER TABLE arc.conversations
+    ALTER COLUMN visibility SET DEFAULT 'private';
+
+ALTER TABLE arc.conversations
+    ALTER COLUMN visibility SET NOT NULL;
+
+-- Drop legacy anonymous check names when upgrading from older schema versions.
+ALTER TABLE arc.conversations
+    DROP CONSTRAINT IF EXISTS conversations_kind_check;
+
+ALTER TABLE arc.conversations
+    DROP CONSTRAINT IF EXISTS chk_conversations_kind;
+
+ALTER TABLE arc.conversations
+    ADD CONSTRAINT chk_conversations_kind CHECK (kind IN ('direct', 'group', 'room'));
+
+ALTER TABLE arc.conversations
+    DROP CONSTRAINT IF EXISTS chk_conversations_visibility;
+
+ALTER TABLE arc.conversations
+    ADD CONSTRAINT chk_conversations_visibility CHECK (visibility IN ('public', 'private'));
+
+CREATE INDEX IF NOT EXISTS idx_conversations_visibility ON arc.conversations (visibility);
 
 -- next_seq is the next allocatable sequence number (starts at 1).
 CREATE TABLE IF NOT EXISTS arc.conversation_cursors (
@@ -412,6 +445,7 @@ CREATE INDEX IF NOT EXISTS idx_invites_revoked_at ON arc.invites (revoked_at);
 CREATE TABLE IF NOT EXISTS arc.conversation_members (
     conversation_id TEXT NOT NULL REFERENCES arc.conversations (id) ON DELETE CASCADE,
     user_id TEXT NOT NULL REFERENCES arc.users (id) ON DELETE CASCADE,
+    joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     role TEXT NOT NULL DEFAULT 'member',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (conversation_id, user_id),
@@ -420,6 +454,19 @@ CREATE TABLE IF NOT EXISTS arc.conversation_members (
     ),
     CONSTRAINT chk_conversation_members_user_id_ulid_len CHECK (char_length(user_id) = 26)
 );
+
+ALTER TABLE arc.conversation_members
+    ADD COLUMN IF NOT EXISTS joined_at TIMESTAMPTZ;
+
+UPDATE arc.conversation_members
+SET joined_at = COALESCE(joined_at, created_at, now())
+WHERE joined_at IS NULL;
+
+ALTER TABLE arc.conversation_members
+    ALTER COLUMN joined_at SET DEFAULT now();
+
+ALTER TABLE arc.conversation_members
+    ALTER COLUMN joined_at SET NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_conversation_members_user_id ON arc.conversation_members (user_id);
 
