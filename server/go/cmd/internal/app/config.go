@@ -4,8 +4,9 @@ import "time"
 
 // Config contains all runtime configuration loaded from environment variables.
 type Config struct {
-	HTTPAddr string
-	LogLevel string
+	HTTPAddr  string
+	LogLevel  string
+	LogFormat string
 
 	ReadHeaderTimeout time.Duration
 	ReadTimeout       time.Duration
@@ -34,8 +35,9 @@ type Config struct {
 // LoadConfig loads Config from environment variables with defaults.
 func LoadConfig() Config {
 	return Config{
-		HTTPAddr: EnvString("ARC_HTTP_ADDR", "0.0.0.0:8080"),
-		LogLevel: EnvString("ARC_LOG_LEVEL", "info"),
+		HTTPAddr:  EnvString("ARC_HTTP_ADDR", "0.0.0.0:8080"),
+		LogLevel:  EnvString("ARC_LOG_LEVEL", "info"),
+		LogFormat: EnvString("ARC_LOG_FORMAT", "auto"),
 
 		ReadHeaderTimeout: EnvDuration("ARC_HTTP_READ_HEADER_TIMEOUT", 5*time.Second),
 		ReadTimeout:       EnvDuration("ARC_HTTP_READ_TIMEOUT", 15*time.Second),

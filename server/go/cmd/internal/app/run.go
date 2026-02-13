@@ -10,7 +10,7 @@ import (
 // It returns an error instead of calling os.Exit to keep defers effective and lint clean.
 func Run() error {
 	cfg := LoadConfig()
-	log := NewLogger(cfg.LogLevel)
+	log := NewLogger(cfg.LogLevel, cfg.LogFormat)
 
 	// Enforce security policy before wiring dependencies.
 	if err := ValidateSecurityConfig(cfg); err != nil {

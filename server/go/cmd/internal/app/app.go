@@ -6,7 +6,9 @@ package app
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	authapi "arc/cmd/internal/auth/api"
@@ -45,7 +47,7 @@ type App struct {
 // New constructs a fully wired App instance from config and logger.
 func New(cfg Config, log Logger) (*App, error) {
 	if log == nil {
-		log = NewLogger(cfg.LogLevel)
+		log = NewLogger(cfg.LogLevel, cfg.LogFormat)
 	}
 
 	st, dbPool, dbEnabled, msgStore, err := newStore(context.Background(), cfg, log)
@@ -113,7 +115,14 @@ func (a *App) Run(ctx context.Context) error {
 		MaxHeaderBytes:    nonZeroInt(a.cfg.MaxHeaderBytes, 1<<20),
 	}
 
-	a.log.Info("server.start", "addr", a.cfg.HTTPAddr, "db_enabled", a.dbEnabled)
+	baseURL := runtimeBaseURL(a.cfg.HTTPAddr)
+	a.log.Info("server.start", "addr", a.cfg.HTTPAddr, "db_enabled", a.dbEnabled, "log_format", a.cfg.LogFormat)
+	a.log.Info("server.endpoints",
+		"base", baseURL,
+		"healthz", baseURL+"/healthz",
+		"readyz", baseURL+"/readyz",
+		"ws", wsBaseURL(baseURL)+"/ws",
+	)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -159,6 +168,32 @@ func nonZeroInt(v, def int) int {
 		return def
 	}
 	return v
+}
+
+func runtimeBaseURL(addr string) string {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		return "http://" + strings.TrimSpace(addr)
+	}
+	host = strings.TrimSpace(host)
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		host = "[" + host + "]"
+	}
+	return "http://" + host + ":" + port
+}
+
+func wsBaseURL(httpBase string) string {
+	switch {
+	case strings.HasPrefix(httpBase, "https://"):
+		return "wss://" + strings.TrimPrefix(httpBase, "https://")
+	case strings.HasPrefix(httpBase, "http://"):
+		return "ws://" + strings.TrimPrefix(httpBase, "http://")
+	default:
+		return "ws://" + httpBase
+	}
 }
 
 // newStore decides between Postgres-backed persistence and in-memory dev store.
