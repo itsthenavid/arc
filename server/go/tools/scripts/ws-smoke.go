@@ -59,7 +59,11 @@ func main() {
 		kind    = flag.String("kind", "direct", "Conversation kind (echoed by server)")
 		text    = flag.String("text", "hello arc 👋", "Message text to send")
 		timeout = flag.Duration("timeout", defaultPerStepTimeout, "Per-step timeout")
-		verbose = flag.Bool("v", false, "Verbose output")
+		// auth-bearer may be passed via flag or WS_SMOKE_AUTH_BEARER env.
+		authBearer = flag.String("auth-bearer", "", "Access token used as Authorization: Bearer <token>")
+		// expect-unauthorized validates that handshake fails with HTTP 401 and exits.
+		expectUnauthorized = flag.Bool("expect-unauthorized", false, "Expect unauthorized (401) handshake failure")
+		verbose            = flag.Bool("v", false, "Verbose output")
 	)
 	flag.Parse()
 
@@ -69,13 +73,26 @@ func main() {
 	if err := validateOrigin(*origin); err != nil {
 		fatalf("invalid -origin: %v", err)
 	}
+	bearer := strings.TrimSpace(*authBearer)
+	if bearer == "" {
+		bearer = strings.TrimSpace(os.Getenv("WS_SMOKE_AUTH_BEARER"))
+	}
 
 	root := context.Background()
 
-	a := mustConnect(root, "A", *wsURL, *origin, *timeout, *verbose)
+	if *expectUnauthorized {
+		if bearer != "" {
+			fatalf("expect-unauthorized and auth-bearer cannot be used together")
+		}
+		mustRejectUnauthorized(root, *wsURL, *origin, *timeout)
+		fmt.Printf("OK: unauthorized handshake rejected\n")
+		return
+	}
+
+	a := mustConnect(root, "A", *wsURL, *origin, bearer, *timeout, *verbose)
 	defer a.Close()
 
-	b := mustConnect(root, "B", *wsURL, *origin, *timeout, *verbose)
+	b := mustConnect(root, "B", *wsURL, *origin, bearer, *timeout, *verbose)
 	defer b.Close()
 
 	if *verbose {
@@ -164,13 +181,16 @@ func validateOrigin(raw string) error {
 
 // ---- connect + hello ----
 
-func mustConnect(parent context.Context, name, wsURL, origin string, stepTimeout time.Duration, verbose bool) *smokeClient {
+func mustConnect(parent context.Context, name, wsURL, origin string, bearer string, stepTimeout time.Duration, verbose bool) *smokeClient {
 	ctx, cancel := context.WithTimeout(parent, stepTimeout)
 	defer cancel()
 
 	h := http.Header{}
 	if strings.TrimSpace(origin) != "" {
 		h.Set("Origin", origin)
+	}
+	if strings.TrimSpace(bearer) != "" {
+		h.Set("Authorization", "Bearer "+strings.TrimSpace(bearer))
 	}
 
 	conn, resp, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
@@ -221,6 +241,37 @@ func mustConnect(parent context.Context, name, wsURL, origin string, stepTimeout
 	c.sessionID = p.SessionID
 
 	return c
+}
+
+func mustRejectUnauthorized(parent context.Context, wsURL, origin string, stepTimeout time.Duration) {
+	ctx, cancel := context.WithTimeout(parent, stepTimeout)
+	defer cancel()
+
+	h := http.Header{}
+	if strings.TrimSpace(origin) != "" {
+		h.Set("Origin", origin)
+	}
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		Subprotocols: []string{defaultSubprotocol},
+		HTTPHeader:   h,
+	})
+	if conn != nil {
+		_ = conn.Close(websocket.StatusNormalClosure, "unexpected success")
+	}
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	if err == nil {
+		fatalf("expected unauthorized handshake failure, got success")
+	}
+	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		fatalf("expected 401 unauthorized handshake, got status=%d err=%v", status, err)
+	}
 }
 
 func assertSubprotocol(resp *http.Response, want string) {

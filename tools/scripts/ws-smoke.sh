@@ -20,19 +20,40 @@ CONV="${CONV:-dev-room-1}"
 KIND="${KIND:-direct}"
 TEXT="${TEXT:-hello arc 👋}"
 TIMEOUT="${TIMEOUT:-7s}"
+AUTH_BEARER="${AUTH_BEARER:-}"
+EXPECT_UNAUTHORIZED="${EXPECT_UNAUTHORIZED:-false}"
 
 if [[ "${URL}" != ws://* && "${URL}" != wss://* ]]; then
   echo "FAIL: ws-smoke.sh: URL must start with ws:// or wss:// (got: ${URL})" >&2
   exit 2
 fi
 
-echo "ws-smoke: url=${URL} origin=${ORIGIN} conv=${CONV} kind=${KIND} timeout=${TIMEOUT}"
+if [[ "${EXPECT_UNAUTHORIZED}" == "true" && -n "${AUTH_BEARER}" ]]; then
+  echo "FAIL: ws-smoke.sh: EXPECT_UNAUTHORIZED=true cannot be combined with AUTH_BEARER" >&2
+  exit 2
+fi
 
-# Run the Go smoke test from the repo root.
-go run ./server/go/tools/scripts/ws-smoke.go \
-  -url "${URL}" \
-  -origin "${ORIGIN}" \
-  -conv "${CONV}" \
-  -kind "${KIND}" \
-  -text "${TEXT}" \
+auth_mode="none"
+if [[ -n "${AUTH_BEARER}" ]]; then
+  auth_mode="bearer"
+fi
+
+echo "ws-smoke: url=${URL} origin=${ORIGIN} conv=${CONV} kind=${KIND} timeout=${TIMEOUT} auth=${auth_mode} expect_unauthorized=${EXPECT_UNAUTHORIZED}"
+
+args=(
+  -url "${URL}"
+  -origin "${ORIGIN}"
+  -conv "${CONV}"
+  -kind "${KIND}"
+  -text "${TEXT}"
   -timeout "${TIMEOUT}"
+)
+if [[ "${EXPECT_UNAUTHORIZED}" == "true" ]]; then
+  args+=(-expect-unauthorized)
+fi
+
+if [[ -n "${AUTH_BEARER}" ]]; then
+  WS_SMOKE_AUTH_BEARER="${AUTH_BEARER}" go run ./server/go/tools/scripts/ws-smoke.go "${args[@]}"
+else
+  go run ./server/go/tools/scripts/ws-smoke.go "${args[@]}"
+fi

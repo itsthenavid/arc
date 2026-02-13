@@ -29,6 +29,10 @@ This directory contains deterministic developer tooling for Arc.
 - Full smoke (memory + postgres): `bash tools/scripts/smoke-all.sh`
 - WebSocket smoke against a running server:
   - `URL="ws://127.0.0.1:8080/ws" bash tools/scripts/ws-smoke.sh`
+  - With bearer auth:
+    - `AUTH_BEARER="<access_token>" URL="ws://127.0.0.1:8080/ws" bash tools/scripts/ws-smoke.sh`
+  - Assert unauthorized handshake rejection (401):
+    - `EXPECT_UNAUTHORIZED=true URL="ws://127.0.0.1:8080/ws" bash tools/scripts/ws-smoke.sh`
 
 ## Outputs / Artifacts
 
