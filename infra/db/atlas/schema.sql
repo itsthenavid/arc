@@ -451,3 +451,10 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON arc.audit_log (created_at
 CREATE INDEX IF NOT EXISTS idx_audit_log_user_id ON arc.audit_log (user_id);
 
 CREATE INDEX IF NOT EXISTS idx_audit_log_session_id ON arc.audit_log (session_id);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_action_created_at ON arc.audit_log (action, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_login_failed_ip_created_at ON arc.audit_log (ip, created_at DESC) WHERE action = 'auth.login.failed'
+AND ip IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_login_failed_identifier_created_at ON arc.audit_log ((meta ->> 'identifier'), created_at DESC) WHERE action = 'auth.login.failed';
