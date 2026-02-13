@@ -46,6 +46,7 @@ jobs:
           # Use server/go/go.mod for Go version to avoid drift.
           go-version-file: server/go/go.mod
           cache: true
+          cache-dependency-path: server/go/go.sum
 
       - name: Install golangci-lint
         run: |
@@ -94,7 +95,17 @@ jobs:
         run: bash tools/scripts/test.sh
 
       - name: Package build (server/go Dockerfile)
-        run: docker build -f server/go/Dockerfile -t arc-server:ci server/go
+        run: |
+          set -euo pipefail
+          for i in 1 2 3; do
+            if docker build -f server/go/Dockerfile -t arc-server:ci .; then
+              exit 0
+            fi
+            if [[ "$i" -eq 3 ]]; then
+              exit 1
+            fi
+            sleep $((i * 2))
+          done
 
   flutter:
     name: Flutter (test)
