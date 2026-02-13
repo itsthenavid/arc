@@ -194,7 +194,7 @@ func colorizeStatusCode(code int, color bool) string {
 	case code >= 500:
 		return ansiRed + s + ansiReset
 	case code >= 400:
-		return ansiYellow + s + ansiReset
+		return ansiRed + s + ansiReset
 	case code >= 300:
 		return ansiMagenta + s + ansiReset
 	default:
@@ -210,7 +210,7 @@ func colorizeStatusClass(class string, color bool) string {
 	case "5xx":
 		return ansiRed + class + ansiReset
 	case "4xx":
-		return ansiYellow + class + ansiReset
+		return ansiRed + class + ansiReset
 	case "3xx":
 		return ansiMagenta + class + ansiReset
 	default:
@@ -255,7 +255,7 @@ func colorizeResult(result string, color bool) string {
 	case "redirect":
 		return ansiMagenta + icon + result + ansiReset
 	case "client_error":
-		return ansiYellow + icon + result + ansiReset
+		return ansiRed + icon + result + ansiReset
 	case "server_error", "failed", "error":
 		return ansiRed + icon + result + ansiReset
 	default:

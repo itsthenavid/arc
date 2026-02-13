@@ -73,14 +73,10 @@ func (h *prettyHandler) Handle(_ context.Context, r slog.Record) error {
 		}
 	}
 
-	mainLine, detailLine := h.renderRecord(r, ts, fields)
+	line := h.renderRecord(r, ts, fields)
 
 	var b strings.Builder
-	b.WriteString(mainLine)
-	if detailLine != "" {
-		b.WriteByte('\n')
-		b.WriteString(detailLine)
-	}
+	b.WriteString(line)
 	b.WriteByte('\n')
 
 	h.mu.Lock()
@@ -136,70 +132,105 @@ func (h *prettyHandler) collectAttr(dst *[]prettyField, a slog.Attr, parent stri
 	})
 }
 
-func (h *prettyHandler) renderRecord(r slog.Record, ts time.Time, fields []prettyField) (string, string) {
-	var main strings.Builder
-	main.WriteString(applyDim(ts.Format("15:04:05.000"), h.color))
-	main.WriteByte(' ')
-	main.WriteString(levelTag(r.Level, h.color))
-	main.WriteByte(' ')
-	main.WriteString(applyBold(r.Message, h.color))
+func (h *prettyHandler) renderRecord(r slog.Record, ts time.Time, fields []prettyField) string {
+	sep := applyDim(" │ ", h.color)
+	parts := []string{
+		applyDim(ts.Format("15:04:05.000"), h.color),
+		levelTag(r.Level, h.color),
+	}
 
 	if r.Message == "http.request" {
-		h.renderHTTPRequestLine(&main, &fields)
+		parts = append(parts, h.renderHTTPRequestSummary(&fields)...)
 	} else {
-		h.renderGenericLine(&main, &fields)
+		parts = append(parts, applyBold(r.Message, h.color))
+		parts = append(parts, h.renderGenericSummary(&fields)...)
 	}
 
-	return main.String(), h.renderDetailLine(fields)
+	if extra := h.renderRemainder(fields, 3); extra != "" {
+		parts = append(parts, extra)
+	}
+
+	return strings.Join(parts, sep)
 }
 
-func (h *prettyHandler) renderHTTPRequestLine(main *strings.Builder, fields *[]prettyField) {
+func (h *prettyHandler) renderHTTPRequestSummary(fields *[]prettyField) []string {
+	methodRaw := "?"
 	if f, ok := popField(fields, "method"); ok {
-		method := strings.ToUpper(strings.TrimSpace(valueToString(f.val)))
-		if method != "" {
-			main.WriteByte(' ')
-			main.WriteString(colorizeHTTPMethod(method, h.color))
+		methodRaw = strings.ToUpper(strings.TrimSpace(valueToString(f.val)))
+		if methodRaw == "" {
+			methodRaw = "?"
 		}
 	}
+	method := colorizeHTTPMethod(methodRaw, h.color)
+
+	pathRaw := "/"
 	if f, ok := popField(fields, "path"); ok {
-		path := strings.TrimSpace(valueToString(f.val))
-		if path != "" {
-			main.WriteByte(' ')
-			if h.color {
-				main.WriteString(ansiCyan + path + ansiReset)
-			} else {
-				main.WriteString(path)
-			}
+		pathRaw = strings.TrimSpace(valueToString(f.val))
+		if pathRaw == "" {
+			pathRaw = "/"
 		}
 	}
+	pathRaw = truncateString(pathRaw, 34)
+	path := pathRaw
+	if h.color {
+		path = ansiCyan + pathRaw + ansiReset
+	}
+
+	status := "?"
 	if f, ok := popField(fields, "status"); ok {
 		if n, okN := valueToInt64(f.val); okN {
-			main.WriteByte(' ')
-			main.WriteString(colorizeStatusCode(int(n), h.color))
+			status = colorizeStatusCode(int(n), h.color)
 		}
 	}
 	_, _ = popField(fields, "status_class")
+
+	duration := "?"
 	if f, ok := popField(fields, "duration_ms"); ok {
 		if n, okN := valueToInt64(f.val); okN {
-			main.WriteByte(' ')
-			main.WriteString(colorizeDurationMS(n, h.color))
+			duration = colorizeDurationMS(n, h.color)
 		}
 	}
+
+	result := ""
 	if f, ok := popField(fields, "result"); ok {
-		result := strings.ToLower(strings.TrimSpace(valueToString(f.val)))
-		if result != "" {
-			main.WriteByte(' ')
-			main.WriteString(colorizeResult(result, h.color))
-		}
+		result = colorizeResult(strings.ToLower(strings.TrimSpace(valueToString(f.val))), h.color)
 	}
+
+	bytesPart := ""
 	if f, ok := popField(fields, "bytes"); ok {
-		main.WriteByte(' ')
-		main.WriteString("bytes=")
-		main.WriteString(valueToString(f.val))
+		bytesPart = "bytes=" + valueToString(f.val)
 	}
+
+	remotePart := ""
+	if f, ok := popField(fields, "remote"); ok {
+		remotePart = "ip=" + truncateString(valueToString(f.val), 24)
+	}
+	uaPart := ""
+	if f, ok := popField(fields, "user_agent"); ok {
+		uaPart = "ua=" + quoteIfNeeded(truncateString(valueToString(f.val), 28))
+	}
+
+	parts := []string{
+		fmt.Sprintf("%s %s", method, path),
+		status,
+		duration,
+	}
+	if result != "" {
+		parts = append(parts, result)
+	}
+	if bytesPart != "" {
+		parts = append(parts, bytesPart)
+	}
+	if remotePart != "" {
+		parts = append(parts, remotePart)
+	}
+	if uaPart != "" {
+		parts = append(parts, uaPart)
+	}
+	return parts
 }
 
-func (h *prettyHandler) renderGenericLine(main *strings.Builder, fields *[]prettyField) {
+func (h *prettyHandler) renderGenericSummary(fields *[]prettyField) []string {
 	inline := takeByKeys(fields,
 		"mode",
 		"addr",
@@ -209,34 +240,31 @@ func (h *prettyHandler) renderGenericLine(main *strings.Builder, fields *[]prett
 		"result",
 		"err",
 	)
+	parts := make([]string, 0, len(inline))
 	for _, f := range inline {
-		main.WriteByte(' ')
-		main.WriteString(h.styleKV(f))
+		parts = append(parts, h.styleKV(f))
 	}
+	return parts
 }
 
-func (h *prettyHandler) renderDetailLine(fields []prettyField) string {
-	if len(fields) == 0 {
+func (h *prettyHandler) renderRemainder(fields []prettyField, maxItems int) string {
+	if len(fields) == 0 || maxItems <= 0 {
 		return ""
 	}
-
 	var b strings.Builder
-	b.WriteString(applyDim("  ↳ ", h.color))
-
-	const maxItems = 5
-	items := 0
-	for i, f := range fields {
-		if items >= maxItems {
-			break
-		}
+	limit := maxItems
+	if limit > len(fields) {
+		limit = len(fields)
+	}
+	for i := 0; i < limit; i++ {
 		if i > 0 {
 			b.WriteByte(' ')
 		}
-		b.WriteString(h.styleKV(f))
-		items++
+		b.WriteString(h.styleKV(fields[i]))
 	}
-	if len(fields) > maxItems {
-		b.WriteString(applyDim(" …", h.color))
+	if len(fields) > limit {
+		b.WriteString(applyDim(" …+", h.color))
+		b.WriteString(strconv.Itoa(len(fields) - limit))
 	}
 	return b.String()
 }
