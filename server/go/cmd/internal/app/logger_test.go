@@ -28,3 +28,24 @@ func TestParseLogLevel(t *testing.T) {
 		}
 	}
 }
+
+func TestLevelTag_NoColor(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		level slog.Level
+		want  string
+	}{
+		{level: slog.LevelDebug, want: "[DEBUG]"},
+		{level: slog.LevelInfo, want: "[INFO]"},
+		{level: slog.LevelWarn, want: "[WARN]"},
+		{level: slog.LevelError, want: "[ERROR]"},
+	}
+
+	for _, tc := range cases {
+		got := levelTag(tc.level, false)
+		if got != tc.want {
+			t.Fatalf("levelTag(%v,false)=%q want=%q", tc.level, got, tc.want)
+		}
+	}
+}

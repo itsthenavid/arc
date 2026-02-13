@@ -58,13 +58,10 @@ func newHandler(level slog.Level, format string) slog.Handler {
 
 	switch format {
 	case "pretty":
-		return slog.NewTextHandler(out, &slog.HandlerOptions{
+		return newPrettyHandler(out, &slog.HandlerOptions{
 			Level:     level,
 			AddSource: level <= slog.LevelDebug,
-			ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
-				return replacePrettyAttr(a, color)
-			},
-		})
+		}, color)
 	case "text":
 		return slog.NewTextHandler(out, &slog.HandlerOptions{
 			Level:     level,
@@ -97,61 +94,6 @@ func replaceTextAttr(a slog.Attr) slog.Attr {
 		if ms, ok := valueToInt64(a.Value); ok {
 			return slog.String("duration", fmt.Sprintf("%dms", ms))
 		}
-	}
-	return a
-}
-
-func replacePrettyAttr(a slog.Attr, color bool) slog.Attr {
-	switch a.Key {
-	case slog.TimeKey:
-		if t, ok := anyToTime(a.Value.Any()); ok {
-			ts := t.Format("15:04:05.000")
-			if color {
-				ts = ansiDim + ts + ansiReset
-			}
-			return slog.String("ts", ts)
-		}
-	case slog.LevelKey:
-		lvl := strings.ToUpper(a.Value.String())
-		return slog.String("lvl", colorizeLevel(lvl, color))
-	case slog.MessageKey:
-		msg := a.Value.String()
-		if color {
-			msg = ansiBright + msg + ansiReset
-		}
-		return slog.String("msg", msg)
-	case slog.SourceKey:
-		if src, ok := anyToSource(a.Value.Any()); ok {
-			short := fmt.Sprintf("%s:%d", filepath.Base(src.File), src.Line)
-			if color {
-				short = ansiDim + short + ansiReset
-			}
-			return slog.String("src", short)
-		}
-	case "method":
-		return slog.String("method", colorizeHTTPMethod(strings.ToUpper(a.Value.String()), color))
-	case "path":
-		path := a.Value.String()
-		if color {
-			path = ansiCyan + path + ansiReset
-		}
-		return slog.String("path", path)
-	case "status":
-		if status, ok := valueToInt64(a.Value); ok {
-			return slog.String("status", colorizeStatusCode(int(status), color))
-		}
-	case "status_class":
-		class := strings.TrimSpace(a.Value.String())
-		if class == "" {
-			return a
-		}
-		return slog.String("class", colorizeStatusClass(class, color))
-	case "duration_ms":
-		if ms, ok := valueToInt64(a.Value); ok {
-			return slog.String("duration", colorizeDurationMS(ms, color))
-		}
-	case "result":
-		return slog.String("result", colorizeResult(strings.ToLower(strings.TrimSpace(a.Value.String())), color))
 	}
 	return a
 }
@@ -223,32 +165,6 @@ func isLikelyTerminal(f *os.File) bool {
 		return false
 	}
 	return (fi.Mode() & os.ModeCharDevice) != 0
-}
-
-func colorizeLevel(level string, color bool) string {
-	switch level {
-	case "DEBUG":
-		level = "DBG"
-	case "WARN":
-		level = "WRN"
-	case "ERROR":
-		level = "ERR"
-	default:
-		level = "INF"
-	}
-	if !color {
-		return level
-	}
-	switch level {
-	case "DBG":
-		return ansiBlue + level + ansiReset
-	case "WRN":
-		return ansiYellow + level + ansiReset
-	case "ERR":
-		return ansiRed + level + ansiReset
-	default:
-		return ansiGreen + level + ansiReset
-	}
 }
 
 func colorizeHTTPMethod(method string, color bool) string {
