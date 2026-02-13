@@ -43,7 +43,7 @@ func TestAuthAPI_LoginFailure_NoEnumeration(t *testing.T) {
 		t.Fatalf("identity.NewPostgresStore: %v", err)
 	}
 
-	username := "auth_login_" + strings.ToLower(mustNewULIDLike(t))
+	username := newTestUsername(t, "alog")
 	password := "Very-Strong-Password-1!"
 	now := time.Now().UTC()
 
@@ -126,7 +126,7 @@ func TestAuthAPI_RefreshReuseDetected_RevokesAll(t *testing.T) {
 		t.Fatalf("identity.NewPostgresStore: %v", err)
 	}
 
-	username := "auth_refresh_" + strings.ToLower(mustNewULIDLike(t))
+	username := newTestUsername(t, "aref")
 	password := "Very-Strong-Password-2!"
 	now := time.Now().UTC()
 
@@ -224,7 +224,7 @@ func TestAuthAPI_LogoutAndLogoutAll(t *testing.T) {
 		t.Fatalf("identity.NewPostgresStore: %v", err)
 	}
 
-	username := "auth_logout_" + strings.ToLower(mustNewULIDLike(t))
+	username := newTestUsername(t, "algt")
 	password := "Very-Strong-Password-3!"
 	now := time.Now().UTC()
 
@@ -335,7 +335,7 @@ func TestAuthAPI_WebCookieCSRFRefreshFlow(t *testing.T) {
 	}
 	t.Cleanup(func() { cleanupInvite(context.Background(), t, pool, inviteRes.Invite.ID) })
 
-	username := "auth_web_" + strings.ToLower(mustNewULIDLike(t))
+	username := newTestUsername(t, "aweb")
 	password := "Very-Strong-Password-4!"
 
 	statusConsume, bodyConsume := doJSON(t, client, ts.URL+"/auth/invites/consume", inviteConsumeRequest{
@@ -593,6 +593,32 @@ func mustNewULIDLike(t *testing.T) string {
 		t.Fatalf("identity.NewULID: %v", err)
 	}
 	return id
+}
+
+func newTestUsername(t *testing.T, prefix string) string {
+	t.Helper()
+
+	prefix = strings.ToLower(strings.TrimSpace(prefix))
+	if prefix == "" {
+		prefix = "u"
+	}
+	if len(prefix) > 5 {
+		prefix = prefix[:5]
+	}
+
+	// users.username constraint is 3..32 chars.
+	maxSuffix := 32 - len(prefix) - 1
+	if maxSuffix < 3 {
+		prefix = "u"
+		maxSuffix = 30
+	}
+
+	suffix := strings.ToLower(mustNewULIDLike(t))
+	if len(suffix) > maxSuffix {
+		suffix = suffix[len(suffix)-maxSuffix:]
+	}
+
+	return prefix + "_" + suffix
 }
 
 func strPtr(s string) *string { return &s }
