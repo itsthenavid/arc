@@ -21,6 +21,7 @@ This directory contains deterministic developer tooling for Arc.
 - Script lint (shellcheck): `bash tools/scripts/shellcheck.sh`
 - Script format (shfmt): `bash tools/scripts/shfmt.sh`
 - Tests: `bash tools/scripts/test.sh`
+- Comprehensive tests (race + coverage + optional benches): `bash tools/scripts/test-all.sh`
 
 ### Local CI (what CI runs)
 - Full local CI: `bash tools/scripts/ci-local.sh`
@@ -40,3 +41,11 @@ This directory contains deterministic developer tooling for Arc.
 
 - `tools/.state/infra.env` — generated ports for infra
 - `tools/.state/smoke.json` — structured smoke report (JSON, stable schema)
+
+## Infra Config Resolution
+
+Compose-related scripts resolve environment files in this order:
+
+1. `infra/.env`
+2. `.env`
+3. `infra/.env.example`

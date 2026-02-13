@@ -33,9 +33,39 @@ INFRA_ENV_FILE="$(infra_env_path)"
 } > "$INFRA_ENV_FILE"
 
 local_compose_file="$(compose_file)"
+compose_env_path=""
+if compose_env_path="$(compose_env_file)"; then
+  :
+fi
 
 echo "infra-up: postgres_port=${POSTGRES_PORT} redis_port=${REDIS_PORT}"
 echo "infra-up: compose_file=${local_compose_file}"
+if [[ -n "${compose_env_path}" ]]; then
+  echo "infra-up: compose_env_file=${compose_env_path}"
+else
+  echo "infra-up: compose_env_file=<none>"
+fi
 echo "infra-up: wrote $(realpath "$INFRA_ENV_FILE")"
 
-docker compose -f "$local_compose_file" up -d --wait
+max_attempts="${INFRA_UP_MAX_ATTEMPTS:-3}"
+if [[ ! "${max_attempts}" =~ ^[0-9]+$ || "${max_attempts}" -lt 1 ]]; then
+  max_attempts=3
+fi
+
+attempt=1
+while [[ "${attempt}" -le "${max_attempts}" ]]; do
+  if compose_cmd "$local_compose_file" up -d --wait; then
+    echo "infra-up: OK (attempt ${attempt}/${max_attempts})"
+    exit 0
+  fi
+
+  if [[ "${attempt}" -eq "${max_attempts}" ]]; then
+    echo "infra-up: FAIL after ${max_attempts} attempt(s)" >&2
+    exit 1
+  fi
+
+  sleep_s=$((attempt * 2))
+  echo "infra-up: retrying in ${sleep_s}s (attempt ${attempt}/${max_attempts})..." >&2
+  sleep "${sleep_s}"
+  attempt=$((attempt + 1))
+done

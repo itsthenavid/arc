@@ -38,3 +38,34 @@ compose_file() {
   echo "Fix: add a compose file in one of these locations or update tools/scripts/compose.sh." >&2
   return 1
 }
+
+compose_env_file() {
+  local candidates=(
+    "${ROOT_DIR}/infra/.env"
+    "${ROOT_DIR}/.env"
+    "${ROOT_DIR}/infra/.env.example"
+  )
+
+  local f
+  for f in "${candidates[@]}"; do
+    if [[ -f "${f}" ]]; then
+      echo "${f}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+compose_cmd() {
+  local local_compose_file="${1:?missing compose file}"
+  shift
+
+  local env_file=""
+  if env_file="$(compose_env_file)"; then
+    docker compose --env-file "${env_file}" -f "${local_compose_file}" "$@"
+    return $?
+  fi
+
+  docker compose -f "${local_compose_file}" "$@"
+}
