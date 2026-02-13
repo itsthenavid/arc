@@ -398,6 +398,8 @@ func (g *WSGateway) onJoin(ctx context.Context, client *Client, env v1.Envelope)
 		return nil, errors.New("missing conversation_id")
 	}
 
+	kind := normalizeConversationKind(p.Kind)
+
 	if g.requireMember {
 		if client.UserID == "" {
 			return nil, errors.New("unauthorized")
@@ -405,16 +407,23 @@ func (g *WSGateway) onJoin(ctx context.Context, client *Client, env v1.Envelope)
 		if g.members == nil {
 			return nil, errors.New("membership store not configured")
 		}
-		ok, err := g.members.IsMember(ctx, client.UserID, convID)
+		info, err := g.members.GetConversation(ctx, convID)
 		if err != nil {
+			if errors.Is(err, ErrConversationNotFound) {
+				return nil, errors.New("conversation not found")
+			}
 			return nil, err
 		}
-		if !ok {
-			return nil, errors.New("not a member of conversation_id")
+		kind = normalizeConversationKind(info.Kind)
+		// Fail closed: only explicit public bypasses membership checks.
+		if info.Visibility != conversationVisibilityPublic {
+			if err := g.ensureConversationMember(ctx, client.UserID, convID); err != nil {
+				return nil, err
+			}
 		}
 	}
 
-	conv := g.hub.GetOrCreateConversation(convID)
+	conv := g.hub.GetOrCreateConversationWithKind(convID, kind)
 	conv.Join(client)
 
 	echoPayload, _ := json.Marshal(v1.ConversationJoinPayload{
@@ -448,20 +457,8 @@ func (g *WSGateway) onMessageSend(ctx context.Context, client *Client, conv *Con
 		return errors.New("missing client_msg_id")
 	}
 
-	if g.requireMember {
-		if client.UserID == "" {
-			return errors.New("unauthorized")
-		}
-		if g.members == nil {
-			return errors.New("membership store not configured")
-		}
-		ok, err := g.members.IsMember(ctx, client.UserID, conv.ID)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return errors.New("not a member of conversation_id")
-		}
+	if err := g.ensureConversationMember(ctx, client.UserID, conv.ID); err != nil {
+		return err
 	}
 
 	text := strings.TrimSpace(p.Text)
@@ -532,20 +529,8 @@ func (g *WSGateway) onHistoryFetch(ctx context.Context, client *Client, conv *Co
 	if convID != conv.ID {
 		return errors.New("not a member of conversation_id")
 	}
-	if g.requireMember {
-		if client.UserID == "" {
-			return errors.New("unauthorized")
-		}
-		if g.members == nil {
-			return errors.New("membership store not configured")
-		}
-		ok, err := g.members.IsMember(ctx, client.UserID, convID)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return errors.New("not a member of conversation_id")
-		}
+	if err := g.ensureConversationMember(ctx, client.UserID, convID); err != nil {
+		return err
 	}
 
 	limit := p.Limit
@@ -729,6 +714,27 @@ func (g *WSGateway) requireAuthenticatedClient(client *Client) error {
 		return errors.New("unauthorized")
 	}
 	return nil
+}
+
+func (g *WSGateway) ensureConversationMember(ctx context.Context, userID, conversationID string) error {
+	if !g.requireMember {
+		return nil
+	}
+	if strings.TrimSpace(userID) == "" {
+		return errors.New("unauthorized")
+	}
+	if g.members == nil {
+		return errors.New("membership store not configured")
+	}
+	err := g.members.EnsureMember(ctx, userID, conversationID)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, ErrMembershipRequired), errors.Is(err, ErrConversationNotFound):
+		return errors.New("not a member of conversation_id")
+	default:
+		return err
+	}
 }
 
 func (g *WSGateway) accessTokenFromRequest(r *http.Request) (string, error) {

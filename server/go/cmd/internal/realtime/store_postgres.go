@@ -110,7 +110,7 @@ func (s *PostgresStore) AppendMessage(ctx context.Context, in AppendMessageInput
 	}
 
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO `+conversations+` (id, kind) VALUES ($1, 'direct')
+		`INSERT INTO `+conversations+` (id, kind, visibility) VALUES ($1, 'direct', 'private')
 		 ON CONFLICT (id) DO NOTHING`,
 		in.ConversationID,
 	); err != nil {

@@ -104,7 +104,7 @@ type HelloAckPayload struct {
 // ConversationJoinPayload requests membership in a conversation.
 type ConversationJoinPayload struct {
 	ConversationID string `json:"conversation_id"`
-	Kind           string `json:"kind,omitempty"` // "direct" | "group" (optional hint)
+	Kind           string `json:"kind,omitempty"` // "direct" | "group" | "room" (optional hint)
 }
 
 // MessageSendPayload requests sending a message into a conversation.
