@@ -43,3 +43,17 @@ func TestParseSameSite(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadConfigFromEnv_EmailAndCaptchaFlags(t *testing.T) {
+	t.Setenv("ARC_AUTH_REQUIRE_EMAIL_VERIFIED", "true")
+	t.Setenv("ARC_AUTH_ENABLE_CAPTCHA", "true")
+
+	cfg := LoadConfigFromEnv()
+
+	if !cfg.RequireEmailVerified {
+		t.Fatalf("expected RequireEmailVerified=true")
+	}
+	if !cfg.EnableCaptcha {
+		t.Fatalf("expected EnableCaptcha=true")
+	}
+}

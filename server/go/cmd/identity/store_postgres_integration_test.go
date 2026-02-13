@@ -747,6 +747,7 @@ CREATE TABLE IF NOT EXISTS %s (
   username_norm TEXT NULL,
   email TEXT NULL,
   email_norm TEXT NULL,
+  email_verified_at TIMESTAMPTZ NULL,
   display_name TEXT NULL,
   bio TEXT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
