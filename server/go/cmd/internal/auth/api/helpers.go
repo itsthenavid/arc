@@ -7,12 +7,13 @@ import (
 
 func toUserResponse(u identity.User) userResponse {
 	return userResponse{
-		ID:          u.ID,
-		Username:    u.Username,
-		Email:       u.Email,
-		DisplayName: u.DisplayName,
-		Bio:         u.Bio,
-		CreatedAt:   u.CreatedAt,
+		ID:              u.ID,
+		Username:        u.Username,
+		Email:           u.Email,
+		EmailVerifiedAt: u.EmailVerifiedAt,
+		DisplayName:     u.DisplayName,
+		Bio:             u.Bio,
+		CreatedAt:       u.CreatedAt,
 	}
 }
 

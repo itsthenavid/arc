@@ -129,7 +129,7 @@ func (s *PostgresStore) GetUserByID(ctx context.Context, userID string) (User, e
 
 	var out User
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, username, username_norm, email, email_norm, display_name, bio, created_at
+		`SELECT id, username, username_norm, email, email_norm, email_verified_at, display_name, bio, created_at
 		   FROM `+users+`
 		  WHERE id = $1`,
 		userID,
@@ -139,6 +139,7 @@ func (s *PostgresStore) GetUserByID(ctx context.Context, userID string) (User, e
 		&out.UsernameNorm,
 		&out.Email,
 		&out.EmailNorm,
+		&out.EmailVerifiedAt,
 		&out.DisplayName,
 		&out.Bio,
 		&out.CreatedAt,
@@ -173,7 +174,7 @@ func (s *PostgresStore) GetUserAuthByUsername(ctx context.Context, username stri
 
 	var out UserAuth
 	err := s.pool.QueryRow(ctx,
-		`SELECT u.id, u.username, u.username_norm, u.email, u.email_norm, u.display_name, u.bio, u.created_at, c.password_hash
+		`SELECT u.id, u.username, u.username_norm, u.email, u.email_norm, u.email_verified_at, u.display_name, u.bio, u.created_at, c.password_hash
 		   FROM `+users+` u
 		   JOIN `+creds+` c ON c.user_id = u.id
 		  WHERE u.username_norm = $1`,
@@ -184,6 +185,7 @@ func (s *PostgresStore) GetUserAuthByUsername(ctx context.Context, username stri
 		&out.User.UsernameNorm,
 		&out.User.Email,
 		&out.User.EmailNorm,
+		&out.User.EmailVerifiedAt,
 		&out.User.DisplayName,
 		&out.User.Bio,
 		&out.User.CreatedAt,
@@ -219,7 +221,7 @@ func (s *PostgresStore) GetUserAuthByEmail(ctx context.Context, email string) (U
 
 	var out UserAuth
 	err := s.pool.QueryRow(ctx,
-		`SELECT u.id, u.username, u.username_norm, u.email, u.email_norm, u.display_name, u.bio, u.created_at, c.password_hash
+		`SELECT u.id, u.username, u.username_norm, u.email, u.email_norm, u.email_verified_at, u.display_name, u.bio, u.created_at, c.password_hash
 		   FROM `+users+` u
 		   JOIN `+creds+` c ON c.user_id = u.id
 		  WHERE u.email_norm = $1`,
@@ -230,6 +232,7 @@ func (s *PostgresStore) GetUserAuthByEmail(ctx context.Context, email string) (U
 		&out.User.UsernameNorm,
 		&out.User.Email,
 		&out.User.EmailNorm,
+		&out.User.EmailVerifiedAt,
 		&out.User.DisplayName,
 		&out.User.Bio,
 		&out.User.CreatedAt,

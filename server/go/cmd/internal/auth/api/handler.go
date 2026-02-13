@@ -27,21 +27,56 @@ type Handler struct {
 	sessions *session.Service
 	sessCfg  session.Config
 
+	emailSender EmailSender
+	captcha     CaptchaVerifier
+
 	dummyHash string
 }
 
+// HandlerOption configures optional auth handler dependencies.
+type HandlerOption func(*Handler)
+
+// WithEmailSender overrides the default no-op email sender.
+func WithEmailSender(sender EmailSender) HandlerOption {
+	return func(h *Handler) {
+		if h == nil || sender == nil {
+			return
+		}
+		h.emailSender = sender
+	}
+}
+
+// WithCaptchaVerifier overrides the default no-op captcha verifier.
+func WithCaptchaVerifier(verifier CaptchaVerifier) HandlerOption {
+	return func(h *Handler) {
+		if h == nil || verifier == nil {
+			return
+		}
+		h.captcha = verifier
+	}
+}
+
 // NewHandler constructs an auth Handler. If dbEnabled is false, handlers return 503.
-func NewHandler(log *slog.Logger, pool *pgxpool.Pool, cfg Config, sessCfg session.Config, dbEnabled bool) (*Handler, error) {
+func NewHandler(log *slog.Logger, pool *pgxpool.Pool, cfg Config, sessCfg session.Config, dbEnabled bool, opts ...HandlerOption) (*Handler, error) {
 	if log == nil {
 		log = slog.Default()
 	}
 
 	h := &Handler{
-		log:       log,
-		cfg:       cfg,
-		dbEnabled: dbEnabled,
-		pool:      pool,
-		sessCfg:   sessCfg,
+		log:         log,
+		cfg:         cfg,
+		dbEnabled:   dbEnabled,
+		pool:        pool,
+		sessCfg:     sessCfg,
+		emailSender: NoopEmailSender{},
+		captcha:     NoopCaptchaVerifier{},
+	}
+
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		opt(h)
 	}
 
 	if !dbEnabled {
@@ -144,6 +179,17 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeRateLimited(w, retryAfter)
 		return
 	}
+	if err := h.enforceCaptcha(ctx, req.Captcha, ip); err != nil {
+		h.auditLoginFailed(ctx, nil, ip, ua, identifier, "captcha_invalid")
+		switch {
+		case errors.Is(err, ErrCaptchaRequired), errors.Is(err, ErrCaptchaInvalid):
+			writeError(w, http.StatusForbidden, "captcha_invalid", "captcha verification failed")
+		default:
+			h.log.Error("auth.login.captcha.fail", "err", err)
+			writeError(w, http.StatusServiceUnavailable, "server_busy", "please retry later")
+		}
+		return
+	}
 
 	userAuth, err := h.lookupUserForLogin(ctx, username, email)
 	if err != nil {
@@ -160,6 +206,11 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if err != nil || !okPw {
 		h.auditLoginFailed(ctx, &userAuth.User.ID, ip, ua, identifier, "bad_password")
 		writeError(w, http.StatusUnauthorized, "invalid_credentials", "invalid credentials")
+		return
+	}
+	if err := h.enforceEmailVerified(userAuth.User); err != nil {
+		h.auditLoginFailed(ctx, &userAuth.User.ID, ip, ua, identifier, "email_not_verified")
+		writeError(w, http.StatusForbidden, "email_not_verified", "email verification required")
 		return
 	}
 
@@ -479,6 +530,16 @@ func (h *Handler) handleInviteConsume(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	now := time.Now().UTC()
 	ip := clientIP(r, h.cfg.TrustProxy)
+	if err := h.enforceCaptcha(ctx, req.Captcha, ip); err != nil {
+		switch {
+		case errors.Is(err, ErrCaptchaRequired), errors.Is(err, ErrCaptchaInvalid):
+			writeError(w, http.StatusForbidden, "captcha_invalid", "captcha verification failed")
+		default:
+			h.log.Error("auth.invite.consume.captcha.fail", "err", err)
+			writeError(w, http.StatusServiceUnavailable, "server_busy", "please retry later")
+		}
+		return
+	}
 	ua := strings.TrimSpace(r.UserAgent())
 	var uaPtr *string
 	if ua != "" {
@@ -528,6 +589,7 @@ func (h *Handler) handleInviteConsume(w http.ResponseWriter, r *http.Request) {
 	} else {
 		h.insertAudit(ctx, "auth.signup", &res.User.ID, &res.Session.ID, ip, ua, nil)
 	}
+	h.maybeSendVerificationEmail(ctx, res.User)
 
 	respSession := sessionResponse{
 		SessionID:        res.Session.ID,
@@ -658,6 +720,59 @@ func (h *Handler) lookupUserForLogin(ctx context.Context, username, email *strin
 		return h.identity.GetUserAuthByEmail(ctx, *email)
 	}
 	return identity.UserAuth{}, identity.OpError{Op: "auth.lookupUser", Kind: identity.ErrInvalidInput}
+}
+
+func (h *Handler) enforceCaptcha(ctx context.Context, token string, ip net.IP) error {
+	if h == nil || !h.cfg.EnableCaptcha {
+		return nil
+	}
+	token = normalizeCaptchaToken(token)
+	if token == "" {
+		return ErrCaptchaRequired
+	}
+	if h.captcha == nil {
+		return errors.New("captcha verifier not configured")
+	}
+	if err := h.captcha.Verify(ctx, token, ip); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		return ErrCaptchaInvalid
+	}
+	return nil
+}
+
+func (h *Handler) enforceEmailVerified(user identity.User) error {
+	if h == nil || !h.cfg.RequireEmailVerified {
+		return nil
+	}
+	if user.Email == nil || strings.TrimSpace(*user.Email) == "" {
+		return ErrEmailNotVerified
+	}
+	if user.EmailVerifiedAt == nil {
+		return ErrEmailNotVerified
+	}
+	return nil
+}
+
+func (h *Handler) maybeSendVerificationEmail(ctx context.Context, user identity.User) {
+	if h == nil || h.emailSender == nil {
+		return
+	}
+	if user.EmailVerifiedAt != nil || user.Email == nil {
+		return
+	}
+	email := strings.TrimSpace(*user.Email)
+	if email == "" {
+		return
+	}
+
+	if err := h.emailSender.SendEmailVerification(ctx, EmailVerificationMessage{
+		UserID: user.ID,
+		Email:  email,
+	}); err != nil {
+		h.log.Error("auth.email_verification.send.fail", "err", err, "user_id", user.ID)
+	}
 }
 
 func clientIP(r *http.Request, trustProxy bool) net.IP {

@@ -13,6 +13,8 @@ type User struct {
 	UsernameNorm *string
 	Email        *string
 	EmailNorm    *string
+	// EmailVerifiedAt is nil when the email has not been verified yet.
+	EmailVerifiedAt *time.Time
 
 	DisplayName *string
 	Bio         *string

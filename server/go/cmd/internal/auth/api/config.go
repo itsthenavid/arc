@@ -10,13 +10,15 @@ import (
 
 // Config controls auth API behavior and security defaults.
 type Config struct {
-	InviteOnly       bool
-	InviteTTL        time.Duration
-	InviteMaxTTL     time.Duration
-	InviteMaxUses    int
-	InviteMaxUsesMax int
-	TrustProxy       bool
-	MaxBodyBytes     int64
+	InviteOnly           bool
+	InviteTTL            time.Duration
+	InviteMaxTTL         time.Duration
+	InviteMaxUses        int
+	InviteMaxUsesMax     int
+	TrustProxy           bool
+	MaxBodyBytes         int64
+	RequireEmailVerified bool
+	EnableCaptcha        bool
 
 	// Optional web transport mode:
 	// refresh token in HttpOnly cookie + CSRF double-submit enforcement on refresh.
@@ -53,6 +55,8 @@ func LoadConfigFromEnv() Config {
 		InviteMaxUsesMax:        envInt("ARC_AUTH_INVITE_MAX_USES_MAX", 50),
 		TrustProxy:              envBool("ARC_AUTH_TRUST_PROXY", false),
 		MaxBodyBytes:            envInt64("ARC_AUTH_MAX_BODY_BYTES", 1<<20), // 1 MiB
+		RequireEmailVerified:    envBool("ARC_AUTH_REQUIRE_EMAIL_VERIFIED", false),
+		EnableCaptcha:           envBool("ARC_AUTH_ENABLE_CAPTCHA", false),
 		WebRefreshCookieEnabled: envBool("ARC_AUTH_WEB_COOKIE_MODE", false),
 		RefreshCookieName:       envString("ARC_AUTH_REFRESH_COOKIE_NAME", "arc_refresh_token"),
 		CSRFCookieName:          envString("ARC_AUTH_CSRF_COOKIE_NAME", "arc_csrf_token"),

@@ -6,6 +6,7 @@ type loginRequest struct {
 	Username   *string `json:"username"`
 	Email      *string `json:"email"`
 	Password   string  `json:"password"`
+	Captcha    string  `json:"captcha_token"`
 	RememberMe bool    `json:"remember_me"`
 	Platform   string  `json:"platform"`
 }
@@ -27,17 +28,19 @@ type inviteConsumeRequest struct {
 	Username    *string `json:"username"`
 	Email       *string `json:"email"`
 	Password    string  `json:"password"`
+	Captcha     string  `json:"captcha_token"`
 	RememberMe  bool    `json:"remember_me"`
 	Platform    string  `json:"platform"`
 }
 
 type userResponse struct {
-	ID          string    `json:"id"`
-	Username    *string   `json:"username"`
-	Email       *string   `json:"email"`
-	DisplayName *string   `json:"display_name"`
-	Bio         *string   `json:"bio"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID              string     `json:"id"`
+	Username        *string    `json:"username"`
+	Email           *string    `json:"email"`
+	EmailVerifiedAt *time.Time `json:"email_verified_at,omitempty"`
+	DisplayName     *string    `json:"display_name"`
+	Bio             *string    `json:"bio"`
+	CreatedAt       time.Time  `json:"created_at"`
 }
 
 type sessionResponse struct {
