@@ -17,6 +17,11 @@ type Config struct {
 	DBMaxConns  int32
 	DBMinConns  int32
 
+	// Strict CORS allowlist for browser clients.
+	CORSAllowedOrigins   []string
+	CORSAllowCredentials bool
+	CORSMaxAgeSeconds    int
+
 	// If true:
 	// - /readyz returns 503 unless DB is configured and reachable.
 	ReadinessRequireDB bool
@@ -42,6 +47,10 @@ func LoadConfig() Config {
 		DatabaseURL: EnvString("ARC_DATABASE_URL", ""),
 		DBMaxConns:  EnvInt32("ARC_DB_MAX_CONNS", 10),
 		DBMinConns:  EnvInt32("ARC_DB_MIN_CONNS", 0),
+
+		CORSAllowedOrigins:   EnvCSV("ARC_HTTP_CORS_ALLOWED_ORIGINS"),
+		CORSAllowCredentials: EnvBool("ARC_HTTP_CORS_ALLOW_CREDENTIALS", true),
+		CORSMaxAgeSeconds:    EnvInt("ARC_HTTP_CORS_MAX_AGE_SECONDS", 600),
 
 		ReadinessRequireDB: EnvBool("ARC_READINESS_REQUIRE_DB", false),
 

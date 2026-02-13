@@ -96,9 +96,16 @@ func (a *App) Run(ctx context.Context) error {
 	// Use the canonical HTTP registration from http.go (so it is not "unused").
 	registerHTTP(mux, a.log, a.cfg, a.dbPool, a.dbEnabled, a.ws, a.auth)
 
+	handler := WithRequestLogging(
+		WithSecurityHeaders(
+			WithCORS(mux, a.cfg, a.log),
+		),
+		a.log,
+	)
+
 	srv := &http.Server{
 		Addr:              a.cfg.HTTPAddr,
-		Handler:           WithRequestLogging(mux, a.log),
+		Handler:           handler,
 		ReadHeaderTimeout: nonZeroDuration(a.cfg.ReadHeaderTimeout, 5*time.Second),
 		ReadTimeout:       nonZeroDuration(a.cfg.ReadTimeout, 15*time.Second),
 		WriteTimeout:      nonZeroDuration(a.cfg.WriteTimeout, 15*time.Second),

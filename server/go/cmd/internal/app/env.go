@@ -70,3 +70,27 @@ func EnvDuration(key string, def time.Duration) time.Duration {
 	}
 	return d
 }
+
+// EnvCSV reads a comma-separated list env var and returns trimmed non-empty entries.
+func EnvCSV(key string) []string {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return nil
+	}
+
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, p := range parts {
+		s := strings.TrimSpace(p)
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
