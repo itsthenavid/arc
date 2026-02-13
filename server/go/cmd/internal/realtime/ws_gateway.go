@@ -37,6 +37,7 @@ const (
 	wsMaxHistoryLimit     = 200
 
 	wsMaxPingFailures = 3
+	wsMaxAccessToken  = 8 << 10 // 8 KiB
 
 	// Secure-by-default for dev.
 	wsDefaultOriginRequired = true
@@ -51,10 +52,12 @@ type WSGateway struct {
 	hub   *Hub
 	store MessageStore
 
-	auth          *session.Service
-	requireAuth   bool
-	members       MembershipStore
-	requireMember bool
+	auth           *session.Service
+	requireAuth    bool
+	authQueryParam string
+	authCookieName string
+	members        MembershipStore
+	requireMember  bool
 
 	devInsecure    bool
 	originRequired bool
@@ -89,6 +92,8 @@ func NewWSGateway(log *slog.Logger, hub *Hub, store MessageStore, auth *session.
 	// Dev-only escape hatch.
 	g.devInsecure = envBoolWS("ARC_WS_DEV_INSECURE", false)
 	g.requireAuth = envBoolWS("ARC_WS_REQUIRE_AUTH", auth != nil)
+	g.authQueryParam = envTokenNameWS("ARC_WS_AUTH_QUERY_PARAM")
+	g.authCookieName = envTokenNameWS("ARC_WS_AUTH_COOKIE_NAME")
 	g.requireMember = envBoolWS("ARC_WS_REQUIRE_MEMBERSHIP", members != nil)
 	if g.requireMember {
 		// Membership checks require authenticated user IDs.
@@ -133,13 +138,13 @@ func (g *WSGateway) HandleWS(w http.ResponseWriter, r *http.Request) {
 		sessionID string
 	)
 
-	if g.requireAuth && !g.devInsecure {
+	if g.requireAuth {
 		if g.auth == nil {
 			http.Error(w, "auth not configured", http.StatusInternalServerError)
 			return
 		}
-		token := bearerToken(r)
-		if token == "" {
+		token, err := g.accessTokenFromRequest(r)
+		if err != nil {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -379,6 +384,10 @@ func (g *WSGateway) onHello(ctx context.Context, client *Client) error {
 }
 
 func (g *WSGateway) onJoin(ctx context.Context, client *Client, env v1.Envelope) (*Conversation, error) {
+	if err := g.requireAuthenticatedClient(client); err != nil {
+		return nil, err
+	}
+
 	var p v1.ConversationJoinPayload
 	if err := json.Unmarshal(env.Payload, &p); err != nil {
 		return nil, fmt.Errorf("invalid payload: %w", err)
@@ -423,6 +432,10 @@ func (g *WSGateway) onJoin(ctx context.Context, client *Client, env v1.Envelope)
 }
 
 func (g *WSGateway) onMessageSend(ctx context.Context, client *Client, conv *Conversation, env v1.Envelope, now time.Time) error {
+	if err := g.requireAuthenticatedClient(client); err != nil {
+		return err
+	}
+
 	var p v1.MessageSendPayload
 	if err := json.Unmarshal(env.Payload, &p); err != nil {
 		return fmt.Errorf("invalid payload: %w", err)
@@ -503,6 +516,10 @@ func (g *WSGateway) onMessageSend(ctx context.Context, client *Client, conv *Con
 }
 
 func (g *WSGateway) onHistoryFetch(ctx context.Context, client *Client, conv *Conversation, env v1.Envelope) error {
+	if err := g.requireAuthenticatedClient(client); err != nil {
+		return err
+	}
+
 	var p v1.ConversationHistoryFetchPayload
 	if err := json.Unmarshal(env.Payload, &p); err != nil {
 		return fmt.Errorf("invalid payload: %w", err)
@@ -704,6 +721,54 @@ func (g *WSGateway) enforceOrigin(r *http.Request) error {
 	return fmt.Errorf("origin not allowed: %s", origin)
 }
 
+func (g *WSGateway) requireAuthenticatedClient(client *Client) error {
+	if !g.requireAuth {
+		return nil
+	}
+	if client == nil || strings.TrimSpace(client.UserID) == "" {
+		return errors.New("unauthorized")
+	}
+	return nil
+}
+
+func (g *WSGateway) accessTokenFromRequest(r *http.Request) (string, error) {
+	if r == nil {
+		return "", errors.New("missing request")
+	}
+
+	if t, err := normalizeAccessTokenWS(bearerToken(r)); err == nil {
+		return t, nil
+	}
+
+	if g.authCookieName != "" {
+		c, err := r.Cookie(g.authCookieName)
+		if err == nil {
+			if t, err := normalizeAccessTokenWS(c.Value); err == nil {
+				return t, nil
+			}
+		}
+	}
+
+	if g.authQueryParam != "" {
+		if t, err := normalizeAccessTokenWS(r.URL.Query().Get(g.authQueryParam)); err == nil {
+			return t, nil
+		}
+	}
+
+	return "", errors.New("missing access token")
+}
+
+func normalizeAccessTokenWS(raw string) (string, error) {
+	t := strings.TrimSpace(raw)
+	if t == "" {
+		return "", errors.New("missing access token")
+	}
+	if len(t) > wsMaxAccessToken {
+		return "", errors.New("access token too large")
+	}
+	return t, nil
+}
+
 func originHostOnly(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -788,6 +853,28 @@ func envCSVWS(key string, def string) []string {
 		}
 	}
 	return out
+}
+
+func envTokenNameWS(key string) string {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return ""
+	}
+	// Conservative name validation for cookie/query parameter identifiers.
+	for _, r := range v {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '_', r == '-', r == '.':
+		default:
+			return ""
+		}
+	}
+	if len(v) > 64 {
+		return ""
+	}
+	return v
 }
 
 func bearerToken(r *http.Request) string {
