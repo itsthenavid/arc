@@ -22,6 +22,11 @@ type prettyHandler struct {
 	mu     *sync.Mutex
 }
 
+type prettyField struct {
+	key string
+	val slog.Value
+}
+
 func newPrettyHandler(w io.Writer, opts *slog.HandlerOptions, color bool) slog.Handler {
 	h := &prettyHandler{
 		w:     w,
@@ -43,39 +48,39 @@ func (h *prettyHandler) Enabled(_ context.Context, level slog.Level) bool {
 }
 
 func (h *prettyHandler) Handle(_ context.Context, r slog.Record) error {
-	var b strings.Builder
-
 	ts := r.Time
 	if ts.IsZero() {
 		ts = time.Now()
 	}
-	b.WriteString("ts=")
-	b.WriteString(applyDim(ts.Format("15:04:05.000"), h.color))
-	b.WriteByte(' ')
-	b.WriteString("lvl=")
-	b.WriteString(levelTag(r.Level, h.color))
-	b.WriteByte(' ')
-	b.WriteString("msg=")
-	b.WriteString(applyBold(r.Message, h.color))
+
+	fields := make([]prettyField, 0, 12)
+	for _, a := range h.attrs {
+		h.collectAttr(&fields, a, "")
+	}
+	r.Attrs(func(a slog.Attr) bool {
+		h.collectAttr(&fields, a, "")
+		return true
+	})
 
 	if h.opts.AddSource && r.PC != 0 {
 		frames := runtime.CallersFrames([]uintptr{r.PC})
 		frame, _ := frames.Next()
 		if frame.File != "" {
-			b.WriteByte(' ')
-			b.WriteString("src=")
-			b.WriteString(applyDim(fmt.Sprintf("%s:%d", filepath.Base(frame.File), frame.Line), h.color))
+			fields = append(fields, prettyField{
+				key: "src",
+				val: slog.StringValue(fmt.Sprintf("%s:%d", filepath.Base(frame.File), frame.Line)),
+			})
 		}
 	}
 
-	for _, a := range h.attrs {
-		h.appendAttr(&b, a, "")
-	}
-	r.Attrs(func(a slog.Attr) bool {
-		h.appendAttr(&b, a, "")
-		return true
-	})
+	mainLine, detailLine := h.renderRecord(r, ts, fields)
 
+	var b strings.Builder
+	b.WriteString(mainLine)
+	if detailLine != "" {
+		b.WriteByte('\n')
+		b.WriteString(detailLine)
+	}
 	b.WriteByte('\n')
 
 	h.mu.Lock()
@@ -99,7 +104,7 @@ func (h *prettyHandler) WithGroup(name string) slog.Handler {
 	return &cp
 }
 
-func (h *prettyHandler) appendAttr(b *strings.Builder, a slog.Attr, parent string) {
+func (h *prettyHandler) collectAttr(dst *[]prettyField, a slog.Attr, parent string) {
 	a.Value = a.Value.Resolve()
 	if a.Equal(slog.Attr{}) {
 		return
@@ -120,25 +125,154 @@ func (h *prettyHandler) appendAttr(b *strings.Builder, a slog.Attr, parent strin
 
 	if a.Value.Kind() == slog.KindGroup {
 		for _, ga := range a.Value.Group() {
-			h.appendAttr(b, ga, fullKey)
+			h.collectAttr(dst, ga, fullKey)
 		}
 		return
 	}
 
-	b.WriteByte(' ')
-	b.WriteString(remapPrettyKey(fullKey))
-	b.WriteByte('=')
-	b.WriteString(h.prettyValue(fullKey, a.Value))
+	*dst = append(*dst, prettyField{
+		key: fullKey,
+		val: a.Value,
+	})
+}
+
+func (h *prettyHandler) renderRecord(r slog.Record, ts time.Time, fields []prettyField) (string, string) {
+	var main strings.Builder
+	main.WriteString(applyDim(ts.Format("15:04:05.000"), h.color))
+	main.WriteByte(' ')
+	main.WriteString(levelTag(r.Level, h.color))
+	main.WriteByte(' ')
+	main.WriteString(applyBold(r.Message, h.color))
+
+	if r.Message == "http.request" {
+		h.renderHTTPRequestLine(&main, &fields)
+	} else {
+		h.renderGenericLine(&main, &fields)
+	}
+
+	return main.String(), h.renderDetailLine(fields)
+}
+
+func (h *prettyHandler) renderHTTPRequestLine(main *strings.Builder, fields *[]prettyField) {
+	if f, ok := popField(fields, "method"); ok {
+		method := strings.ToUpper(strings.TrimSpace(valueToString(f.val)))
+		if method != "" {
+			main.WriteByte(' ')
+			main.WriteString(colorizeHTTPMethod(method, h.color))
+		}
+	}
+	if f, ok := popField(fields, "path"); ok {
+		path := strings.TrimSpace(valueToString(f.val))
+		if path != "" {
+			main.WriteByte(' ')
+			if h.color {
+				main.WriteString(ansiCyan + path + ansiReset)
+			} else {
+				main.WriteString(path)
+			}
+		}
+	}
+	if f, ok := popField(fields, "status"); ok {
+		if n, okN := valueToInt64(f.val); okN {
+			main.WriteByte(' ')
+			main.WriteString(colorizeStatusCode(int(n), h.color))
+		}
+	}
+	_, _ = popField(fields, "status_class")
+	if f, ok := popField(fields, "duration_ms"); ok {
+		if n, okN := valueToInt64(f.val); okN {
+			main.WriteByte(' ')
+			main.WriteString(colorizeDurationMS(n, h.color))
+		}
+	}
+	if f, ok := popField(fields, "result"); ok {
+		result := strings.ToLower(strings.TrimSpace(valueToString(f.val)))
+		if result != "" {
+			main.WriteByte(' ')
+			main.WriteString(colorizeResult(result, h.color))
+		}
+	}
+	if f, ok := popField(fields, "bytes"); ok {
+		main.WriteByte(' ')
+		main.WriteString("bytes=")
+		main.WriteString(valueToString(f.val))
+	}
+}
+
+func (h *prettyHandler) renderGenericLine(main *strings.Builder, fields *[]prettyField) {
+	inline := takeByKeys(fields,
+		"mode",
+		"addr",
+		"db_enabled",
+		"log_format",
+		"reason",
+		"result",
+		"err",
+	)
+	for _, f := range inline {
+		main.WriteByte(' ')
+		main.WriteString(h.styleKV(f))
+	}
+}
+
+func (h *prettyHandler) renderDetailLine(fields []prettyField) string {
+	if len(fields) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString(applyDim("  ↳ ", h.color))
+
+	const maxItems = 5
+	items := 0
+	for i, f := range fields {
+		if items >= maxItems {
+			break
+		}
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(h.styleKV(f))
+		items++
+	}
+	if len(fields) > maxItems {
+		b.WriteString(applyDim(" …", h.color))
+	}
+	return b.String()
+}
+
+func takeByKeys(fields *[]prettyField, keys ...string) []prettyField {
+	out := make([]prettyField, 0, len(keys))
+	for _, k := range keys {
+		if f, ok := popField(fields, k); ok {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func popField(fields *[]prettyField, key string) (prettyField, bool) {
+	for i, f := range *fields {
+		if f.key == key {
+			*fields = append((*fields)[:i], (*fields)[i+1:]...)
+			return f, true
+		}
+	}
+	return prettyField{}, false
+}
+
+func (h *prettyHandler) styleKV(f prettyField) string {
+	key := remapPrettyKey(f.key)
+	val := h.prettyValue(key, f.val)
+	return key + "=" + val
 }
 
 func (h *prettyHandler) prettyValue(key string, v slog.Value) string {
-	trimmedKey := strings.TrimSpace(key)
-
-	switch trimmedKey {
+	switch key {
 	case "method":
-		return colorizeHTTPMethod(strings.ToUpper(strings.TrimSpace(v.String())), h.color)
+		return colorizeHTTPMethod(strings.ToUpper(strings.TrimSpace(valueToString(v))), h.color)
 	case "path":
-		path := strings.TrimSpace(v.String())
+		path := strings.TrimSpace(valueToString(v))
 		if h.color {
 			return ansiCyan + path + ansiReset
 		}
@@ -147,18 +281,27 @@ func (h *prettyHandler) prettyValue(key string, v slog.Value) string {
 		if n, ok := valueToInt64(v); ok {
 			return colorizeStatusCode(int(n), h.color)
 		}
-	case "status_class", "class":
-		return colorizeStatusClass(strings.TrimSpace(v.String()), h.color)
-	case "duration_ms":
+	case "class":
+		return colorizeStatusClass(strings.TrimSpace(valueToString(v)), h.color)
+	case "duration":
 		if n, ok := valueToInt64(v); ok {
 			return colorizeDurationMS(n, h.color)
 		}
 	case "result":
-		return colorizeResult(strings.ToLower(strings.TrimSpace(v.String())), h.color)
+		return colorizeResult(strings.ToLower(strings.TrimSpace(valueToString(v))), h.color)
+	case "user_agent":
+		return quoteIfNeeded(truncateString(valueToString(v), 56))
+	case "err":
+		s := quoteIfNeeded(truncateString(valueToString(v), 96))
+		if h.color {
+			return ansiRed + s + ansiReset
+		}
+		return s
+	case "src":
+		return applyDim(quoteIfNeeded(valueToString(v)), h.color)
 	}
 
-	plain := valueToString(v)
-	return quoteIfNeeded(plain)
+	return quoteIfNeeded(valueToString(v))
 }
 
 func remapPrettyKey(k string) string {
@@ -206,27 +349,38 @@ func quoteIfNeeded(s string) string {
 	return s
 }
 
+func truncateString(s string, maxLen int) string {
+	if maxLen <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= maxLen {
+		return s
+	}
+	return string(r[:maxLen-1]) + "…"
+}
+
 func levelTag(level slog.Level, color bool) string {
 	switch {
 	case level >= slog.LevelError:
 		if color {
-			return ansiRed + "[ERROR]" + ansiReset
+			return ansiRed + "❌ ERROR" + ansiReset
 		}
 		return "[ERROR]"
 	case level >= slog.LevelWarn:
 		if color {
-			return ansiYellow + "[WARN]" + ansiReset
+			return ansiYellow + "⚠ WARN" + ansiReset
 		}
 		return "[WARN]"
 	case level < slog.LevelInfo:
 		if color {
-			return ansiMagenta + "[DEBUG]" + ansiReset
+			return ansiMagenta + "🛠 DEBUG" + ansiReset
 		}
 		return "[DEBUG]"
 	default:
 		// INFO is always blue by design.
 		if color {
-			return ansiBlue + "[INFO]" + ansiReset
+			return ansiBlue + "ℹ INFO" + ansiReset
 		}
 		return "[INFO]"
 	}

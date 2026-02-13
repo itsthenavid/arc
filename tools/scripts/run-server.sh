@@ -37,10 +37,10 @@ fi
 label() {
   local name="${1}"
   case "${name}" in
-    INFO) printf "%s[INFO]%s" "${c_info}" "${c_reset}" ;;
-    WARN) printf "%s[WARN]%s" "${c_warn}" "${c_reset}" ;;
-    ERROR) printf "%s[ERROR]%s" "${c_error}" "${c_reset}" ;;
-    OK) printf "%s[OK]%s" "${c_ok}" "${c_reset}" ;;
+    INFO) printf "%s[ℹ INFO]%s" "${c_info}" "${c_reset}" ;;
+    WARN) printf "%s[⚠ WARN]%s" "${c_warn}" "${c_reset}" ;;
+    ERROR) printf "%s[✖ ERROR]%s" "${c_error}" "${c_reset}" ;;
+    OK) printf "%s[✔ OK]%s" "${c_ok}" "${c_reset}" ;;
     *) printf "[%s]" "${name}" ;;
   esac
 }
@@ -68,7 +68,7 @@ else
   mode="postgres"
 fi
 
-printf "%sArc Server Runtime%s\n" "${c_title}" "${c_reset}"
+printf "%s✨ Arc Server Runtime%s\n" "${c_title}" "${c_reset}"
 printf "%s------------------------------%s\n" "${c_dim}" "${c_reset}"
 line "INFO" "http_addr: ${HTTP_ADDR}"
 line "INFO" "mode: ${mode}"
@@ -89,7 +89,7 @@ if [[ "${REQUIRE_HMAC}" == "true" && ${#TOKEN_HMAC_KEY} -ge 32 ]]; then
   line "OK" "token HMAC policy enabled"
 fi
 printf "%s------------------------------%s\n" "${c_dim}" "${c_reset}"
-line "OK" "launching server"
+line "OK" "🚀 launching server"
 
 export ARC_HTTP_ADDR="${HTTP_ADDR}"
 export ARC_DATABASE_URL="${DB_URL}"

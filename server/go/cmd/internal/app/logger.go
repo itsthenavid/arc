@@ -234,20 +234,32 @@ func colorizeDurationMS(ms int64, color bool) string {
 }
 
 func colorizeResult(result string, color bool) string {
+	icon := ""
+	switch result {
+	case "success":
+		icon = "✅ "
+	case "redirect":
+		icon = "↪ "
+	case "client_error":
+		icon = "⚠ "
+	case "server_error", "failed", "error":
+		icon = "🛑 "
+	}
+
 	if !color {
-		return result
+		return icon + result
 	}
 	switch result {
 	case "success":
-		return ansiGreen + result + ansiReset
+		return ansiGreen + icon + result + ansiReset
 	case "redirect":
-		return ansiMagenta + result + ansiReset
+		return ansiMagenta + icon + result + ansiReset
 	case "client_error":
-		return ansiYellow + result + ansiReset
+		return ansiYellow + icon + result + ansiReset
 	case "server_error", "failed", "error":
-		return ansiRed + result + ansiReset
+		return ansiRed + icon + result + ansiReset
 	default:
-		return ansiBlue + result + ansiReset
+		return ansiBlue + icon + result + ansiReset
 	}
 }
 
