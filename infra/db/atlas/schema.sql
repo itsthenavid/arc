@@ -447,6 +447,104 @@ CREATE TABLE IF NOT EXISTS arc.invites (
     )
 );
 
+-- PR-011 readiness: evolve invites in-place for older local databases.
+ALTER TABLE arc.invites
+    ADD COLUMN IF NOT EXISTS max_uses INT;
+
+ALTER TABLE arc.invites
+    ADD COLUMN IF NOT EXISTS used_count INT;
+
+ALTER TABLE arc.invites
+    ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ;
+
+ALTER TABLE arc.invites
+    ADD COLUMN IF NOT EXISTS note TEXT;
+
+UPDATE arc.invites
+SET max_uses = 1
+WHERE max_uses IS NULL;
+
+UPDATE arc.invites
+SET used_count = 0
+WHERE used_count IS NULL;
+
+ALTER TABLE arc.invites
+    ALTER COLUMN max_uses SET DEFAULT 1;
+
+ALTER TABLE arc.invites
+    ALTER COLUMN used_count SET DEFAULT 0;
+
+ALTER TABLE arc.invites
+    ALTER COLUMN max_uses SET NOT NULL;
+
+ALTER TABLE arc.invites
+    ALTER COLUMN used_count SET NOT NULL;
+
+ALTER TABLE arc.invites
+    DROP CONSTRAINT IF EXISTS chk_invites_id_ulid_len;
+
+ALTER TABLE arc.invites
+    ADD CONSTRAINT chk_invites_id_ulid_len CHECK (char_length(id) = 26);
+
+ALTER TABLE arc.invites
+    DROP CONSTRAINT IF EXISTS chk_invites_token_hash_len;
+
+ALTER TABLE arc.invites
+    ADD CONSTRAINT chk_invites_token_hash_len CHECK (char_length(token_hash) = 64);
+
+ALTER TABLE arc.invites
+    DROP CONSTRAINT IF EXISTS chk_invites_expires_after_created;
+
+ALTER TABLE arc.invites
+    ADD CONSTRAINT chk_invites_expires_after_created CHECK (expires_at > created_at);
+
+ALTER TABLE arc.invites
+    DROP CONSTRAINT IF EXISTS chk_invites_max_uses;
+
+ALTER TABLE arc.invites
+    ADD CONSTRAINT chk_invites_max_uses CHECK (max_uses >= 1);
+
+ALTER TABLE arc.invites
+    DROP CONSTRAINT IF EXISTS chk_invites_used_count;
+
+ALTER TABLE arc.invites
+    ADD CONSTRAINT chk_invites_used_count CHECK (used_count >= 0 AND used_count <= max_uses);
+
+ALTER TABLE arc.invites
+    DROP CONSTRAINT IF EXISTS chk_invites_revoked_after_created;
+
+ALTER TABLE arc.invites
+    ADD CONSTRAINT chk_invites_revoked_after_created CHECK (
+        revoked_at IS NULL
+        OR revoked_at >= created_at
+    );
+
+ALTER TABLE arc.invites
+    DROP CONSTRAINT IF EXISTS chk_invites_note_len;
+
+ALTER TABLE arc.invites
+    ADD CONSTRAINT chk_invites_note_len CHECK (
+        note IS NULL
+        OR char_length(note) <= 512
+    );
+
+ALTER TABLE arc.invites
+    DROP CONSTRAINT IF EXISTS chk_invites_consumed_at_after_created;
+
+ALTER TABLE arc.invites
+    ADD CONSTRAINT chk_invites_consumed_at_after_created CHECK (
+        consumed_at IS NULL
+        OR consumed_at >= created_at
+    );
+
+ALTER TABLE arc.invites
+    DROP CONSTRAINT IF EXISTS chk_invites_consumed_by_pair;
+
+ALTER TABLE arc.invites
+    ADD CONSTRAINT chk_invites_consumed_by_pair CHECK (
+        (consumed_at IS NULL) = (consumed_by IS NULL)
+    );
+
 CREATE UNIQUE INDEX IF NOT EXISTS uq_invites_token_hash ON arc.invites (token_hash);
 
 CREATE INDEX IF NOT EXISTS idx_invites_expires_at ON arc.invites (expires_at);

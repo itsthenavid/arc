@@ -15,7 +15,6 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${ROOT_DIR}"
 
 URL="${URL:-ws://127.0.0.1:8080/ws}"
-ORIGIN="${ORIGIN:-http://localhost}"
 CONV="${CONV:-dev-room-1}"
 KIND="${KIND:-direct}"
 TEXT="${TEXT:-hello arc 👋}"
@@ -27,6 +26,18 @@ EXPECT_UNAUTHORIZED="${EXPECT_UNAUTHORIZED:-false}"
 if [[ "${URL}" != ws://* && "${URL}" != wss://* ]]; then
   echo "FAIL: ws-smoke.sh: URL must start with ws:// or wss:// (got: ${URL})" >&2
   exit 2
+fi
+
+if [[ -z "${ORIGIN:-}" ]]; then
+  if [[ "${URL}" == wss://* ]]; then
+    _origin_scheme="https"
+    _tmp="${URL#wss://}"
+  else
+    _origin_scheme="http"
+    _tmp="${URL#ws://}"
+  fi
+  _origin_host="${_tmp%%/*}"
+  ORIGIN="${_origin_scheme}://${_origin_host}"
 fi
 
 if [[ "${EXPECT_UNAUTHORIZED}" == "true" && (-n "${AUTH_BEARER}" || -n "${AUTH_QUERY_PARAM}") ]]; then
