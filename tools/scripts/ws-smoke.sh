@@ -21,6 +21,7 @@ KIND="${KIND:-direct}"
 TEXT="${TEXT:-hello arc 👋}"
 TIMEOUT="${TIMEOUT:-7s}"
 AUTH_BEARER="${AUTH_BEARER:-}"
+AUTH_QUERY_PARAM="${AUTH_QUERY_PARAM:-}"
 EXPECT_UNAUTHORIZED="${EXPECT_UNAUTHORIZED:-false}"
 
 if [[ "${URL}" != ws://* && "${URL}" != wss://* ]]; then
@@ -28,14 +29,22 @@ if [[ "${URL}" != ws://* && "${URL}" != wss://* ]]; then
   exit 2
 fi
 
-if [[ "${EXPECT_UNAUTHORIZED}" == "true" && -n "${AUTH_BEARER}" ]]; then
-  echo "FAIL: ws-smoke.sh: EXPECT_UNAUTHORIZED=true cannot be combined with AUTH_BEARER" >&2
+if [[ "${EXPECT_UNAUTHORIZED}" == "true" && (-n "${AUTH_BEARER}" || -n "${AUTH_QUERY_PARAM}") ]]; then
+  echo "FAIL: ws-smoke.sh: EXPECT_UNAUTHORIZED=true cannot be combined with AUTH_BEARER/AUTH_QUERY_PARAM" >&2
+  exit 2
+fi
+
+if [[ -n "${AUTH_QUERY_PARAM}" && -z "${AUTH_BEARER}" ]]; then
+  echo "FAIL: ws-smoke.sh: AUTH_QUERY_PARAM requires AUTH_BEARER" >&2
   exit 2
 fi
 
 auth_mode="none"
 if [[ -n "${AUTH_BEARER}" ]]; then
   auth_mode="bearer"
+fi
+if [[ -n "${AUTH_QUERY_PARAM}" ]]; then
+  auth_mode="query"
 fi
 
 echo "ws-smoke: url=${URL} origin=${ORIGIN} conv=${CONV} kind=${KIND} timeout=${TIMEOUT} auth=${auth_mode} expect_unauthorized=${EXPECT_UNAUTHORIZED}"
@@ -50,6 +59,9 @@ args=(
 )
 if [[ "${EXPECT_UNAUTHORIZED}" == "true" ]]; then
   args+=(-expect-unauthorized)
+fi
+if [[ -n "${AUTH_QUERY_PARAM}" ]]; then
+  args+=(-auth-query-param "${AUTH_QUERY_PARAM}")
 fi
 
 if [[ -n "${AUTH_BEARER}" ]]; then

@@ -61,6 +61,8 @@ func main() {
 		timeout = flag.Duration("timeout", defaultPerStepTimeout, "Per-step timeout")
 		// auth-bearer may be passed via flag or WS_SMOKE_AUTH_BEARER env.
 		authBearer = flag.String("auth-bearer", "", "Access token used as Authorization: Bearer <token>")
+		// auth-query-param enables query-based token transport (e.g. access_token).
+		authQueryParam = flag.String("auth-query-param", "", "Query parameter name used for access token transport")
 		// expect-unauthorized validates that handshake fails with HTTP 401 and exits.
 		expectUnauthorized = flag.Bool("expect-unauthorized", false, "Expect unauthorized (401) handshake failure")
 		verbose            = flag.Bool("v", false, "Verbose output")
@@ -77,22 +79,26 @@ func main() {
 	if bearer == "" {
 		bearer = strings.TrimSpace(os.Getenv("WS_SMOKE_AUTH_BEARER"))
 	}
+	queryParam := strings.TrimSpace(*authQueryParam)
 
 	root := context.Background()
 
 	if *expectUnauthorized {
-		if bearer != "" {
-			fatalf("expect-unauthorized and auth-bearer cannot be used together")
+		if bearer != "" || queryParam != "" {
+			fatalf("expect-unauthorized cannot be combined with auth-bearer/auth-query-param")
 		}
 		mustRejectUnauthorized(root, *wsURL, *origin, *timeout)
 		fmt.Printf("OK: unauthorized handshake rejected\n")
 		return
 	}
+	if queryParam != "" && bearer == "" {
+		fatalf("auth-query-param requires a bearer token")
+	}
 
-	a := mustConnect(root, "A", *wsURL, *origin, bearer, *timeout, *verbose)
+	a := mustConnect(root, "A", *wsURL, *origin, bearer, queryParam, *timeout, *verbose)
 	defer a.Close()
 
-	b := mustConnect(root, "B", *wsURL, *origin, bearer, *timeout, *verbose)
+	b := mustConnect(root, "B", *wsURL, *origin, bearer, queryParam, *timeout, *verbose)
 	defer b.Close()
 
 	if *verbose {
@@ -181,19 +187,31 @@ func validateOrigin(raw string) error {
 
 // ---- connect + hello ----
 
-func mustConnect(parent context.Context, name, wsURL, origin string, bearer string, stepTimeout time.Duration, verbose bool) *smokeClient {
+func mustConnect(parent context.Context, name, wsURL, origin string, bearer string, queryParam string, stepTimeout time.Duration, verbose bool) *smokeClient {
 	ctx, cancel := context.WithTimeout(parent, stepTimeout)
 	defer cancel()
+
+	dialURL := wsURL
+	if strings.TrimSpace(queryParam) != "" {
+		u, err := url.Parse(wsURL)
+		if err != nil {
+			fatalf("connect %s: invalid ws url: %v", name, err)
+		}
+		q := u.Query()
+		q.Set(strings.TrimSpace(queryParam), strings.TrimSpace(bearer))
+		u.RawQuery = q.Encode()
+		dialURL = u.String()
+	}
 
 	h := http.Header{}
 	if strings.TrimSpace(origin) != "" {
 		h.Set("Origin", origin)
 	}
-	if strings.TrimSpace(bearer) != "" {
+	if strings.TrimSpace(bearer) != "" && strings.TrimSpace(queryParam) == "" {
 		h.Set("Authorization", "Bearer "+strings.TrimSpace(bearer))
 	}
 
-	conn, resp, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+	conn, resp, err := websocket.Dial(ctx, dialURL, &websocket.DialOptions{
 		Subprotocols: []string{defaultSubprotocol},
 		HTTPHeader:   h,
 	})

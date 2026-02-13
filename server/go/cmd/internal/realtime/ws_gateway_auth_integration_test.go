@@ -40,7 +40,7 @@ func TestWSGateway_RequireAuth_UnauthorizedRejected(t *testing.T) {
 	ts := startWSTestServer(t, gw)
 	defer ts.Close()
 
-	_, resp, err := dialWS(t, ts.URL, "", "")
+	_, resp, err := dialWS(t, ts.URL, wsDialInput{})
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
 	}
@@ -76,7 +76,10 @@ func TestWSGateway_RequireAuth_InvalidTokenRejected(t *testing.T) {
 	ts := startWSTestServer(t, gw)
 	defer ts.Close()
 
-	_, resp, err := dialWS(t, ts.URL, "http://localhost", "not-a-valid-token")
+	_, resp, err := dialWS(t, ts.URL, wsDialInput{
+		Origin: "http://localhost",
+		Bearer: "not-a-valid-token",
+	})
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
 	}
@@ -117,7 +120,10 @@ func TestWSGateway_RequireAuth_ExpiredTokenRejected(t *testing.T) {
 	ts := startWSTestServer(t, gw)
 	defer ts.Close()
 
-	_, resp, err := dialWS(t, ts.URL, "http://localhost", expiredToken)
+	_, resp, err := dialWS(t, ts.URL, wsDialInput{
+		Origin: "http://localhost",
+		Bearer: expiredToken,
+	})
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
 	}
@@ -158,7 +164,7 @@ func TestWSGateway_RequireAuth_AuthorizedConnectAndActions(t *testing.T) {
 	ts := startWSTestServer(t, gw)
 	defer ts.Close()
 
-	conn, resp, err := dialWS(t, ts.URL, "", accessToken)
+	conn, resp, err := dialWS(t, ts.URL, wsDialInput{Bearer: accessToken})
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
 	}
@@ -220,6 +226,157 @@ func TestWSGateway_RequireAuth_AuthorizedConnectAndActions(t *testing.T) {
 	}
 }
 
+func TestWSGateway_RequireAuth_DevInsecureDoesNotBypassAuth(t *testing.T) {
+	t.Setenv("ARC_WS_DEV_INSECURE", "true")
+	t.Setenv("ARC_WS_REQUIRE_AUTH", "true")
+	t.Setenv("ARC_WS_REQUIRE_MEMBERSHIP", "false")
+	t.Setenv("ARC_WS_ORIGIN_REQUIRED", "false")
+
+	now := time.Now().UTC()
+	row := session.Row{
+		ID:        "sess-auth-5",
+		UserID:    "user-auth-5",
+		CreatedAt: now,
+		ExpiresAt: now.Add(1 * time.Hour),
+		Platform:  session.PlatformWeb,
+	}
+
+	authSvc, _ := newWSAuthService(t, row, 15*time.Minute)
+	gw := newWSAuthGateway(t, authSvc)
+	ts := startWSTestServer(t, gw)
+	defer ts.Close()
+
+	_, resp, err := dialWS(t, ts.URL, wsDialInput{})
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	if err == nil {
+		t.Fatalf("expected unauthorized handshake failure")
+	}
+	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("expected 401, got status=%d err=%v", status, err)
+	}
+}
+
+func TestWSGateway_RequireAuth_QueryParamFallback(t *testing.T) {
+	t.Setenv("ARC_WS_DEV_INSECURE", "false")
+	t.Setenv("ARC_WS_REQUIRE_AUTH", "true")
+	t.Setenv("ARC_WS_REQUIRE_MEMBERSHIP", "false")
+	t.Setenv("ARC_WS_ORIGIN_REQUIRED", "false")
+	t.Setenv("ARC_WS_AUTH_QUERY_PARAM", "access_token")
+
+	now := time.Now().UTC()
+	row := session.Row{
+		ID:        "sess-auth-6",
+		UserID:    "user-auth-6",
+		CreatedAt: now,
+		ExpiresAt: now.Add(1 * time.Hour),
+		Platform:  session.PlatformWeb,
+	}
+
+	authSvc, tokens := newWSAuthService(t, row, 15*time.Minute)
+	accessToken, _, err := tokens.Issue(row.UserID, row.ID, now)
+	if err != nil {
+		t.Fatalf("issue token: %v", err)
+	}
+
+	gw := newWSAuthGateway(t, authSvc)
+	ts := startWSTestServer(t, gw)
+	defer ts.Close()
+
+	conn, resp, err := dialWS(t, ts.URL, wsDialInput{
+		QueryParam: "access_token",
+		QueryValue: accessToken,
+	})
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	if err != nil {
+		t.Fatalf("query-param authorized dial failed: %v", err)
+	}
+	_ = conn.Close(websocket.StatusNormalClosure, "bye")
+}
+
+func TestWSGateway_RequireAuth_CookieFallback(t *testing.T) {
+	t.Setenv("ARC_WS_DEV_INSECURE", "false")
+	t.Setenv("ARC_WS_REQUIRE_AUTH", "true")
+	t.Setenv("ARC_WS_REQUIRE_MEMBERSHIP", "false")
+	t.Setenv("ARC_WS_ORIGIN_REQUIRED", "false")
+	t.Setenv("ARC_WS_AUTH_COOKIE_NAME", "arc_access_token")
+
+	now := time.Now().UTC()
+	row := session.Row{
+		ID:        "sess-auth-7",
+		UserID:    "user-auth-7",
+		CreatedAt: now,
+		ExpiresAt: now.Add(1 * time.Hour),
+		Platform:  session.PlatformWeb,
+	}
+
+	authSvc, tokens := newWSAuthService(t, row, 15*time.Minute)
+	accessToken, _, err := tokens.Issue(row.UserID, row.ID, now)
+	if err != nil {
+		t.Fatalf("issue token: %v", err)
+	}
+
+	gw := newWSAuthGateway(t, authSvc)
+	ts := startWSTestServer(t, gw)
+	defer ts.Close()
+
+	conn, resp, err := dialWS(t, ts.URL, wsDialInput{
+		CookieName:  "arc_access_token",
+		CookieValue: accessToken,
+	})
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	if err != nil {
+		t.Fatalf("cookie authorized dial failed: %v", err)
+	}
+	_ = conn.Close(websocket.StatusNormalClosure, "bye")
+}
+
+func TestWSGateway_RequireAuth_RejectsOversizedToken(t *testing.T) {
+	t.Setenv("ARC_WS_DEV_INSECURE", "false")
+	t.Setenv("ARC_WS_REQUIRE_AUTH", "true")
+	t.Setenv("ARC_WS_REQUIRE_MEMBERSHIP", "false")
+	t.Setenv("ARC_WS_ORIGIN_REQUIRED", "false")
+
+	now := time.Now().UTC()
+	row := session.Row{
+		ID:        "sess-auth-8",
+		UserID:    "user-auth-8",
+		CreatedAt: now,
+		ExpiresAt: now.Add(1 * time.Hour),
+		Platform:  session.PlatformWeb,
+	}
+
+	authSvc, _ := newWSAuthService(t, row, 15*time.Minute)
+	gw := newWSAuthGateway(t, authSvc)
+	ts := startWSTestServer(t, gw)
+	defer ts.Close()
+
+	oversized := strings.Repeat("a", wsMaxAccessToken+1)
+	_, resp, err := dialWS(t, ts.URL, wsDialInput{Bearer: oversized})
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	if err == nil {
+		t.Fatalf("expected unauthorized handshake failure")
+	}
+	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("expected 401, got status=%d err=%v", status, err)
+	}
+}
+
 func newWSAuthGateway(t *testing.T, authSvc *session.Service) *WSGateway {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -233,7 +390,16 @@ func startWSTestServer(t *testing.T, gw *WSGateway) *httptest.Server {
 	return httptest.NewServer(mux)
 }
 
-func dialWS(t *testing.T, baseHTTPURL string, origin string, bearerToken string) (*websocket.Conn, *http.Response, error) {
+type wsDialInput struct {
+	Origin      string
+	Bearer      string
+	QueryParam  string
+	QueryValue  string
+	CookieName  string
+	CookieValue string
+}
+
+func dialWS(t *testing.T, baseHTTPURL string, in wsDialInput) (*websocket.Conn, *http.Response, error) {
 	t.Helper()
 
 	u, err := url.Parse(baseHTTPURL)
@@ -242,13 +408,21 @@ func dialWS(t *testing.T, baseHTTPURL string, origin string, bearerToken string)
 	}
 	u.Scheme = "ws"
 	u.Path = "/ws"
+	if strings.TrimSpace(in.QueryParam) != "" {
+		q := u.Query()
+		q.Set(strings.TrimSpace(in.QueryParam), in.QueryValue)
+		u.RawQuery = q.Encode()
+	}
 
 	h := http.Header{}
-	if strings.TrimSpace(origin) != "" {
-		h.Set("Origin", origin)
+	if strings.TrimSpace(in.Origin) != "" {
+		h.Set("Origin", in.Origin)
 	}
-	if strings.TrimSpace(bearerToken) != "" {
-		h.Set("Authorization", "Bearer "+bearerToken)
+	if strings.TrimSpace(in.Bearer) != "" {
+		h.Set("Authorization", "Bearer "+in.Bearer)
+	}
+	if strings.TrimSpace(in.CookieName) != "" {
+		h.Set("Cookie", strings.TrimSpace(in.CookieName)+"="+in.CookieValue)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
