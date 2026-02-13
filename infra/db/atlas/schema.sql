@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS arc.users (
 
   email TEXT NULL,
   email_norm TEXT NULL,
+  email_verified_at TIMESTAMPTZ NULL,
 
   display_name TEXT NULL,
   bio TEXT NULL,
@@ -121,10 +122,26 @@ CONSTRAINT chk_users_username_nonempty CHECK (username IS NULL OR char_length(bt
 
   CONSTRAINT chk_users_email_len CHECK (email IS NULL OR (char_length(email) >= 3 AND char_length(email) <= 320)),
   CONSTRAINT chk_users_email_norm_len CHECK (email_norm IS NULL OR (char_length(email_norm) >= 3 AND char_length(email_norm) <= 320)),
+  CONSTRAINT chk_users_email_verified_after_created CHECK (
+      email_verified_at IS NULL
+      OR email_verified_at >= created_at
+  ),
 
   CONSTRAINT chk_users_display_name_len CHECK (display_name IS NULL OR char_length(display_name) <= 80),
   CONSTRAINT chk_users_bio_len CHECK (bio IS NULL OR char_length(bio) <= 512)
 );
+
+ALTER TABLE arc.users
+    ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ;
+
+ALTER TABLE arc.users
+    DROP CONSTRAINT IF EXISTS chk_users_email_verified_after_created;
+
+ALTER TABLE arc.users
+    ADD CONSTRAINT chk_users_email_verified_after_created CHECK (
+        email_verified_at IS NULL
+        OR email_verified_at >= created_at
+    );
 
 DROP TRIGGER IF EXISTS trg_users_updated_at ON arc.users;
 
@@ -437,6 +454,37 @@ CREATE INDEX IF NOT EXISTS idx_invites_expires_at ON arc.invites (expires_at);
 CREATE INDEX IF NOT EXISTS idx_invites_consumed_at ON arc.invites (consumed_at);
 
 CREATE INDEX IF NOT EXISTS idx_invites_revoked_at ON arc.invites (revoked_at);
+
+-- =========================
+-- Email verification readiness (PR-011)
+-- =========================
+
+CREATE TABLE IF NOT EXISTS arc.email_verification_tokens (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES arc.users (id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    consumed_at TIMESTAMPTZ NULL,
+    CONSTRAINT chk_email_verification_tokens_id_ulid_len CHECK (char_length(id) = 26),
+    CONSTRAINT chk_email_verification_tokens_user_id_ulid_len CHECK (char_length(user_id) = 26),
+    CONSTRAINT chk_email_verification_tokens_hash_len CHECK (char_length(token_hash) = 64),
+    CONSTRAINT chk_email_verification_tokens_expires_after_created CHECK (expires_at > created_at),
+    CONSTRAINT chk_email_verification_tokens_consumed_after_created CHECK (
+        consumed_at IS NULL
+        OR consumed_at >= created_at
+    )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_email_verification_tokens_hash ON arc.email_verification_tokens (token_hash);
+
+CREATE INDEX IF NOT EXISTS idx_email_verification_tokens_user_id ON arc.email_verification_tokens (user_id);
+
+CREATE INDEX IF NOT EXISTS idx_email_verification_tokens_expires_at ON arc.email_verification_tokens (expires_at);
+
+CREATE INDEX IF NOT EXISTS idx_email_verification_tokens_active ON arc.email_verification_tokens (user_id, expires_at DESC)
+WHERE
+    consumed_at IS NULL;
 
 -- =========================
 -- Membership (authoritative)
