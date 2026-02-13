@@ -185,6 +185,20 @@ func (s *Service) RotateRefresh(ctx context.Context, now time.Time, refreshToken
 		return Issued{}, ErrSessionRevoked
 	}
 
+	// Per-session refresh throttling to reduce refresh storms and abuse.
+	if s.cfg.RefreshMinInterval > 0 {
+		lastUsed := row.CreatedAt
+		if row.LastUsedAt != nil {
+			lastUsed = *row.LastUsedAt
+		}
+		if retryAfter := lastUsed.Add(s.cfg.RefreshMinInterval).Sub(now); retryAfter > 0 {
+			return Issued{}, RefreshRateLimitError{
+				SessionID:  row.ID,
+				RetryAfter: retryAfter,
+			}
+		}
+	}
+
 	// Rotate: create new session + revoke old + point replaced_by.
 	newRefreshPlain, newRefreshHash, err := newOpaqueRefreshToken(s.cfg.RefreshTokenBytes)
 	if err != nil {

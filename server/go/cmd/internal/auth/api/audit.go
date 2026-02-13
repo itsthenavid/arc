@@ -32,6 +32,21 @@ func (h *Handler) auditRefreshSuccess(ctx context.Context, sessionID string, ip 
 	h.insertAudit(ctx, "auth.refresh.success", nil, &sessionID, ip, ua, nil)
 }
 
+func (h *Handler) auditRefreshRateLimited(ctx context.Context, sessionID string, ip net.IP, ua string, retryAfter time.Duration) {
+	sessionID = strings.TrimSpace(sessionID)
+	var sid *string
+	if sessionID != "" {
+		sid = &sessionID
+	}
+	retrySeconds := int64(0)
+	if retryAfter > 0 {
+		retrySeconds = int64(retryAfter.Seconds())
+	}
+	h.insertAudit(ctx, "auth.refresh.rate_limited", nil, sid, ip, ua, map[string]any{
+		"retry_after_s": retrySeconds,
+	})
+}
+
 func (h *Handler) auditRefreshReuse(ctx context.Context, ip net.IP, ua string) {
 	h.insertAudit(ctx, "auth.refresh.reuse_detected", nil, nil, ip, ua, nil)
 }

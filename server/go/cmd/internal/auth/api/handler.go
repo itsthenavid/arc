@@ -125,7 +125,21 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 	identifier := loginIdentifier(username, email)
 
 	// IP-based throttling before DB lookup.
-	if blocked, retryAfter, err := h.checkLoginIPThrottle(ctx, ip, now); err == nil && blocked {
+	if blocked, retryAfter, err := h.checkLoginIPThrottle(ctx, ip, now); err != nil {
+		h.log.Error("auth.login.throttle_ip.fail", "err", err)
+		writeError(w, http.StatusServiceUnavailable, "server_busy", "please retry later")
+		return
+	} else if blocked {
+		h.auditLoginRateLimited(ctx, nil, ip, ua, identifier, retryAfter)
+		writeRateLimited(w, retryAfter)
+		return
+	}
+	// Identifier-based throttling before DB lookup to avoid extra auth DB load.
+	if blocked, retryAfter, err := h.checkLoginIdentifierThrottle(ctx, identifier, now); err != nil {
+		h.log.Error("auth.login.throttle_identifier.fail", "err", err)
+		writeError(w, http.StatusServiceUnavailable, "server_busy", "please retry later")
+		return
+	} else if blocked {
 		h.auditLoginRateLimited(ctx, nil, ip, ua, identifier, retryAfter)
 		writeRateLimited(w, retryAfter)
 		return
@@ -139,12 +153,6 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 		h.auditLoginFailed(ctx, nil, ip, ua, identifier, "not_found")
 		writeError(w, http.StatusUnauthorized, "invalid_credentials", "invalid credentials")
-		return
-	}
-
-	if blocked, retryAfter, err := h.checkLoginUserThrottle(ctx, userAuth.User.ID, now); err == nil && blocked {
-		h.auditLoginRateLimited(ctx, &userAuth.User.ID, ip, ua, identifier, retryAfter)
-		writeRateLimited(w, retryAfter)
 		return
 	}
 
@@ -236,6 +244,16 @@ func (h *Handler) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	issued, err := h.sessions.RotateRefresh(ctx, now, refreshToken, dev)
 	if err != nil {
 		switch {
+		case errors.Is(err, session.ErrRefreshRateLimited):
+			var rlErr session.RefreshRateLimitError
+			if errors.As(err, &rlErr) {
+				h.auditRefreshRateLimited(ctx, rlErr.SessionID, ip, ua, rlErr.RetryAfter)
+				writeRateLimitedError(w, rlErr.RetryAfter, "refresh_rate_limited", "refresh attempted too frequently")
+				return
+			}
+			h.auditRefreshRateLimited(ctx, "", ip, ua, 0)
+			writeRateLimitedError(w, 0, "refresh_rate_limited", "refresh attempted too frequently")
+			return
 		case errors.Is(err, session.ErrRefreshReuseDetected):
 			h.auditRefreshReuse(ctx, ip, ua)
 			writeError(w, http.StatusUnauthorized, "refresh_reuse_detected", "refresh token reuse detected")

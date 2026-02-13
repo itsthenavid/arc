@@ -25,6 +25,10 @@ type Config struct {
 	RefreshTTLNative      time.Duration
 	RefreshTTLNativeShort time.Duration
 
+	// RefreshMinInterval enforces a minimum time between refresh attempts
+	// for the same active session. Zero disables refresh throttling.
+	RefreshMinInterval time.Duration
+
 	// ClockSkew defines the allowed time skew during token validation.
 	ClockSkew time.Duration
 
@@ -47,6 +51,7 @@ func DefaultConfig() Config {
 		RefreshTTLWeb:         7 * 24 * time.Hour,
 		RefreshTTLNative:      60 * 24 * time.Hour,
 		RefreshTTLNativeShort: 14 * 24 * time.Hour,
+		RefreshMinInterval:    0,
 		ClockSkew:             30 * time.Second,
 		RefreshTokenBytes:     32,
 	}
@@ -63,6 +68,7 @@ func DefaultConfig() Config {
 //   - ARC_AUTH_REFRESH_TTL_WEB
 //   - ARC_AUTH_REFRESH_TTL_NATIVE
 //   - ARC_AUTH_REFRESH_TTL_NATIVE_SHORT
+//   - ARC_AUTH_REFRESH_MIN_INTERVAL
 //   - ARC_AUTH_CLOCK_SKEW
 //   - ARC_AUTH_REFRESH_TOKEN_BYTES
 //
@@ -104,6 +110,14 @@ func LoadConfigFromEnv() (Config, error) {
 			return Config{}, ErrConfig
 		}
 		cfg.RefreshTTLNativeShort = d
+	}
+
+	if v := os.Getenv("ARC_AUTH_REFRESH_MIN_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 {
+			return Config{}, ErrConfig
+		}
+		cfg.RefreshMinInterval = d
 	}
 
 	if v := os.Getenv("ARC_AUTH_CLOCK_SKEW"); v != "" {
