@@ -90,6 +90,66 @@ func TestPostgresSession_IssueAndRotateRefresh_Succeeds(t *testing.T) {
 	}
 }
 
+func TestPostgresSession_RotateRefresh_RateLimited(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	dbURL := os.Getenv("ARC_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("ARC_DATABASE_URL is not set; skipping Postgres integration test")
+	}
+
+	pool := mustPGXPool(ctx, t, dbURL)
+	defer pool.Close()
+
+	cfg, tokens := mustTestConfigAndTokens(t)
+	cfg.RefreshMinInterval = 2 * time.Minute
+	store := NewPostgresStore(pool)
+	svc := NewService(cfg, pool, store, tokens)
+
+	userID := newULID(t)
+	mustCreateUser(ctx, t, pool, userID)
+	t.Cleanup(func() { cleanupUserData(ctx, t, pool, userID) })
+
+	now := time.Now().UTC()
+	dev := DeviceContext{
+		Platform:   PlatformWeb,
+		RememberMe: false,
+		UserAgent:  "arc-test/1.0",
+	}
+
+	issued, err := svc.IssueSession(ctx, now, userID, dev)
+	if err != nil {
+		t.Fatalf("IssueSession: %v", err)
+	}
+
+	_, err = svc.RotateRefresh(ctx, now.Add(30*time.Second), issued.RefreshToken, dev)
+	if err == nil {
+		t.Fatalf("expected ErrRefreshRateLimited, got nil")
+	}
+	if !errors.Is(err, ErrRefreshRateLimited) {
+		t.Fatalf("expected ErrRefreshRateLimited, got %v", err)
+	}
+	var rlErr RefreshRateLimitError
+	if !errors.As(err, &rlErr) {
+		t.Fatalf("expected RefreshRateLimitError, got %T", err)
+	}
+	if rlErr.SessionID != issued.SessionID {
+		t.Fatalf("expected session id %q, got %q", issued.SessionID, rlErr.SessionID)
+	}
+	if rlErr.RetryAfter <= 0 {
+		t.Fatalf("expected positive retry after, got %v", rlErr.RetryAfter)
+	}
+
+	rotated, err := svc.RotateRefresh(ctx, now.Add(2*time.Minute+1*time.Second), issued.RefreshToken, dev)
+	if err != nil {
+		t.Fatalf("RotateRefresh after interval: %v", err)
+	}
+	if rotated.SessionID == "" || rotated.RefreshToken == "" {
+		t.Fatalf("expected rotated session and refresh token")
+	}
+}
+
 func TestPostgresSession_RotateRefresh_ReuseDetected_RevokesAll(t *testing.T) {
 	t.Parallel()
 

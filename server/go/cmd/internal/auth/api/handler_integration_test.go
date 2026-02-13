@@ -407,6 +407,183 @@ func TestAuthAPI_WebCookieCSRFRefreshFlow(t *testing.T) {
 	}
 }
 
+func TestAuthAPI_LoginRateLimited_ByIdentifier(t *testing.T) {
+	pool := mustOpenAuthTestPool(t)
+	defer pool.Close()
+	clearAuthAuditLog(context.Background(), t, pool)
+
+	cfg := testAuthConfig()
+	cfg.LoginUserMax = 2
+	cfg.LoginUserWindow = 10 * time.Minute
+	cfg.LockoutShortThreshold = 0
+	cfg.LockoutLongThreshold = 0
+	cfg.LockoutSevereThreshold = 0
+
+	h := mustNewAuthHandler(t, pool, cfg)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mux := http.NewServeMux()
+		h.Register(mux)
+		mux.ServeHTTP(w, r)
+	}))
+	defer ts.Close()
+
+	client := ts.Client()
+	idStore, err := identity.NewPostgresStore(pool)
+	if err != nil {
+		t.Fatalf("identity.NewPostgresStore: %v", err)
+	}
+
+	username := newTestUsername(t, "arlid")
+	password := "Very-Strong-Password-5!"
+	createRes, err := idStore.CreateUser(context.Background(), identity.CreateUserInput{
+		Username: &username,
+		Password: password,
+		Now:      time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	t.Cleanup(func() { cleanupAuthUser(context.Background(), t, pool, createRes.User.ID) })
+
+	for i := 0; i < 2; i++ {
+		status, body := doJSON(t, client, ts.URL+"/auth/login", loginRequest{
+			Username: &username,
+			Password: "Wrong-Password-5!",
+			Platform: "ios",
+		}, nil)
+		if status != http.StatusUnauthorized {
+			t.Fatalf("expected 401 on failed login #%d, got %d body=%s", i+1, status, string(body))
+		}
+	}
+
+	status, body, hdr := doJSONWithHeaders(t, client, ts.URL+"/auth/login", loginRequest{
+		Username: &username,
+		Password: password,
+		Platform: "ios",
+	}, nil)
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 after identifier throttling, got %d body=%s", status, string(body))
+	}
+	var er errorResponse
+	if err := json.Unmarshal(body, &er); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if er.Error.Code != "rate_limited" {
+		t.Fatalf("expected rate_limited code, got %q", er.Error.Code)
+	}
+	if strings.TrimSpace(hdr.Get("Retry-After")) == "" {
+		t.Fatalf("expected Retry-After header on throttled response")
+	}
+}
+
+func TestAuthAPI_LoginRateLimited_ByIP(t *testing.T) {
+	pool := mustOpenAuthTestPool(t)
+	defer pool.Close()
+	clearAuthAuditLog(context.Background(), t, pool)
+
+	cfg := testAuthConfig()
+	cfg.LoginIPMax = 1
+	cfg.LoginIPWindow = 10 * time.Minute
+	cfg.LoginUserMax = 100
+	cfg.LockoutShortThreshold = 0
+	cfg.LockoutLongThreshold = 0
+	cfg.LockoutSevereThreshold = 0
+
+	h := mustNewAuthHandler(t, pool, cfg)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mux := http.NewServeMux()
+		h.Register(mux)
+		mux.ServeHTTP(w, r)
+	}))
+	defer ts.Close()
+
+	client := ts.Client()
+	statusA, bodyA := doJSON(t, client, ts.URL+"/auth/login", loginRequest{
+		Username: strPtr(newTestUsername(t, "ipone")),
+		Password: "does-not-matter",
+		Platform: "ios",
+	}, nil)
+	if statusA != http.StatusUnauthorized {
+		t.Fatalf("expected first request to fail with 401, got %d body=%s", statusA, string(bodyA))
+	}
+
+	statusB, bodyB, hdr := doJSONWithHeaders(t, client, ts.URL+"/auth/login", loginRequest{
+		Username: strPtr(newTestUsername(t, "iptwo")),
+		Password: "does-not-matter",
+		Platform: "ios",
+	}, nil)
+	if statusB != http.StatusTooManyRequests {
+		t.Fatalf("expected second request to be rate-limited, got %d body=%s", statusB, string(bodyB))
+	}
+
+	var er errorResponse
+	if err := json.Unmarshal(bodyB, &er); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if er.Error.Code != "rate_limited" {
+		t.Fatalf("expected rate_limited code, got %q", er.Error.Code)
+	}
+	if strings.TrimSpace(hdr.Get("Retry-After")) == "" {
+		t.Fatalf("expected Retry-After header on throttled response")
+	}
+}
+
+func TestAuthAPI_RefreshRateLimited(t *testing.T) {
+	pool := mustOpenAuthTestPool(t)
+	defer pool.Close()
+	clearAuthAuditLog(context.Background(), t, pool)
+
+	cfg := testAuthConfig()
+	h := mustNewAuthHandler(t, pool, cfg, func(sessCfg *session.Config) {
+		sessCfg.RefreshMinInterval = 30 * time.Minute
+	})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mux := http.NewServeMux()
+		h.Register(mux)
+		mux.ServeHTTP(w, r)
+	}))
+	defer ts.Close()
+
+	client := ts.Client()
+	idStore, err := identity.NewPostgresStore(pool)
+	if err != nil {
+		t.Fatalf("identity.NewPostgresStore: %v", err)
+	}
+
+	username := newTestUsername(t, "arrf")
+	password := "Very-Strong-Password-6!"
+	createRes, err := idStore.CreateUser(context.Background(), identity.CreateUserInput{
+		Username: &username,
+		Password: password,
+		Now:      time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	t.Cleanup(func() { cleanupAuthUser(context.Background(), t, pool, createRes.User.ID) })
+
+	login := mustLoginForTest(t, client, ts.URL, username, password, "ios")
+
+	status, body, hdr := doJSONWithHeaders(t, client, ts.URL+"/auth/refresh", refreshRequest{
+		RefreshToken: login.Session.RefreshToken,
+		Platform:     "ios",
+	}, nil)
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 from refresh min interval, got %d body=%s", status, string(body))
+	}
+
+	var er errorResponse
+	if err := json.Unmarshal(body, &er); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if er.Error.Code != "refresh_rate_limited" {
+		t.Fatalf("expected refresh_rate_limited code, got %q", er.Error.Code)
+	}
+	if strings.TrimSpace(hdr.Get("Retry-After")) == "" {
+		t.Fatalf("expected Retry-After header for refresh rate limit")
+	}
+}
+
 func mustLoginForTest(t *testing.T, client *http.Client, baseURL, username, password, platform string) loginResponse {
 	t.Helper()
 	status, body := doJSON(t, client, baseURL+"/auth/login", loginRequest{
@@ -452,11 +629,16 @@ func testAuthConfig() Config {
 	}
 }
 
-func mustNewAuthHandler(t *testing.T, pool *pgxpool.Pool, cfg Config) *Handler {
+func mustNewAuthHandler(t *testing.T, pool *pgxpool.Pool, cfg Config, mutateSessionCfg ...func(*session.Config)) *Handler {
 	t.Helper()
 	secret := paseto.NewV4AsymmetricSecretKey()
 	sessCfg := session.DefaultConfig()
 	sessCfg.PasetoV4SecretKeyHex = secret.ExportHex()
+	for _, fn := range mutateSessionCfg {
+		if fn != nil {
+			fn(&sessCfg)
+		}
+	}
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h, err := NewHandler(log, pool, cfg, sessCfg, true)
@@ -467,6 +649,12 @@ func mustNewAuthHandler(t *testing.T, pool *pgxpool.Pool, cfg Config) *Handler {
 }
 
 func doJSON(t *testing.T, client *http.Client, url string, payload any, headers map[string]string) (int, []byte) {
+	t.Helper()
+	status, body, _ := doJSONWithHeaders(t, client, url, payload, headers)
+	return status, body
+}
+
+func doJSONWithHeaders(t *testing.T, client *http.Client, url string, payload any, headers map[string]string) (int, []byte, http.Header) {
 	t.Helper()
 
 	b, err := json.Marshal(payload)
@@ -493,7 +681,7 @@ func doJSON(t *testing.T, client *http.Client, url string, payload any, headers 
 	if err != nil {
 		t.Fatalf("io.ReadAll: %v", err)
 	}
-	return resp.StatusCode, body
+	return resp.StatusCode, body, resp.Header.Clone()
 }
 
 func cookieValueByName(cookies []*http.Cookie, name string) string {
@@ -584,6 +772,16 @@ func cleanupInvite(ctx context.Context, t *testing.T, pool *pgxpool.Pool, invite
 		return
 	}
 	_, _ = pool.Exec(ctx, `DELETE FROM arc.invites WHERE id = $1`, inviteID)
+}
+
+func clearAuthAuditLog(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	if pool == nil {
+		return
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM arc.audit_log`); err != nil {
+		t.Fatalf("clear audit log: %v", err)
+	}
 }
 
 func mustNewULIDLike(t *testing.T) string {

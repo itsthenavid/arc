@@ -46,6 +46,17 @@ func TestLoadConfigFromEnv_InvalidNativeTTLOrder(t *testing.T) {
 	}
 }
 
+func TestLoadConfigFromEnv_InvalidRefreshMinInterval(t *testing.T) {
+	secret := paseto.NewV4AsymmetricSecretKey()
+	t.Setenv("ARC_PASETO_V4_SECRET_KEY_HEX", secret.ExportHex())
+	t.Setenv("ARC_AUTH_REFRESH_MIN_INTERVAL", "-1s")
+
+	_, err := LoadConfigFromEnv()
+	if err != ErrConfig {
+		t.Fatalf("expected ErrConfig for negative refresh min interval, got %v", err)
+	}
+}
+
 func TestLoadConfigFromEnv_Valid(t *testing.T) {
 	secret := paseto.NewV4AsymmetricSecretKey()
 	t.Setenv("ARC_PASETO_V4_SECRET_KEY_HEX", secret.ExportHex())
@@ -54,6 +65,7 @@ func TestLoadConfigFromEnv_Valid(t *testing.T) {
 	t.Setenv("ARC_AUTH_REFRESH_TTL_WEB", "48h")
 	t.Setenv("ARC_AUTH_REFRESH_TTL_NATIVE", "720h")
 	t.Setenv("ARC_AUTH_REFRESH_TTL_NATIVE_SHORT", "168h")
+	t.Setenv("ARC_AUTH_REFRESH_MIN_INTERVAL", "45s")
 	t.Setenv("ARC_AUTH_CLOCK_SKEW", "20s")
 	t.Setenv("ARC_AUTH_REFRESH_TOKEN_BYTES", "32")
 
@@ -76,6 +88,9 @@ func TestLoadConfigFromEnv_Valid(t *testing.T) {
 	}
 	if cfg.RefreshTTLNativeShort != 168*time.Hour {
 		t.Fatalf("refresh native short ttl mismatch: %v", cfg.RefreshTTLNativeShort)
+	}
+	if cfg.RefreshMinInterval != 45*time.Second {
+		t.Fatalf("refresh min interval mismatch: %v", cfg.RefreshMinInterval)
 	}
 	if cfg.ClockSkew != 20*time.Second {
 		t.Fatalf("clock skew mismatch: %v", cfg.ClockSkew)
