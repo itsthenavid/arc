@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -146,11 +147,13 @@ func (h *prettyHandler) renderRecord(r slog.Record, ts time.Time, fields []prett
 		parts = append(parts, h.renderGenericSummary(&fields)...)
 	}
 
-	if extra := h.renderRemainder(fields, 3); extra != "" {
-		parts = append(parts, extra)
+	if extra := h.renderRemainder(fields, 3); len(extra) > 0 {
+		parts = append(parts, extra...)
 	}
 
-	return strings.Join(parts, sep)
+	width := h.terminalWidth()
+	lines := wrapSegments(parts, sep, width, applyDim("   ↳ ", h.color))
+	return strings.Join(lines, "\n")
 }
 
 func (h *prettyHandler) renderHTTPRequestSummary(fields *[]prettyField) []string {
@@ -247,26 +250,22 @@ func (h *prettyHandler) renderGenericSummary(fields *[]prettyField) []string {
 	return parts
 }
 
-func (h *prettyHandler) renderRemainder(fields []prettyField, maxItems int) string {
+func (h *prettyHandler) renderRemainder(fields []prettyField, maxItems int) []string {
 	if len(fields) == 0 || maxItems <= 0 {
-		return ""
+		return nil
 	}
-	var b strings.Builder
 	limit := maxItems
 	if limit > len(fields) {
 		limit = len(fields)
 	}
+	out := make([]string, 0, limit+1)
 	for i := 0; i < limit; i++ {
-		if i > 0 {
-			b.WriteByte(' ')
-		}
-		b.WriteString(h.styleKV(fields[i]))
+		out = append(out, h.styleKV(fields[i]))
 	}
 	if len(fields) > limit {
-		b.WriteString(applyDim(" …+", h.color))
-		b.WriteString(strconv.Itoa(len(fields) - limit))
+		out = append(out, applyDim("…+"+strconv.Itoa(len(fields)-limit), h.color))
 	}
-	return b.String()
+	return out
 }
 
 func takeByKeys(fields *[]prettyField, keys ...string) []prettyField {
@@ -301,6 +300,7 @@ func (h *prettyHandler) prettyValue(key string, v slog.Value) string {
 		return colorizeHTTPMethod(strings.ToUpper(strings.TrimSpace(valueToString(v))), h.color)
 	case "path":
 		path := strings.TrimSpace(valueToString(v))
+		path = truncateString(path, 56)
 		if h.color {
 			return ansiCyan + path + ansiReset
 		}
@@ -319,6 +319,8 @@ func (h *prettyHandler) prettyValue(key string, v slog.Value) string {
 		return colorizeResult(strings.ToLower(strings.TrimSpace(valueToString(v))), h.color)
 	case "user_agent":
 		return quoteIfNeeded(truncateString(valueToString(v), 56))
+	case "base", "healthz", "readyz", "ws":
+		return truncateString(valueToString(v), 36)
 	case "err":
 		s := quoteIfNeeded(truncateString(valueToString(v), 96))
 		if h.color {
@@ -329,7 +331,7 @@ func (h *prettyHandler) prettyValue(key string, v slog.Value) string {
 		return applyDim(quoteIfNeeded(valueToString(v)), h.color)
 	}
 
-	return quoteIfNeeded(valueToString(v))
+	return quoteIfNeeded(truncateString(valueToString(v), 72))
 }
 
 func remapPrettyKey(k string) string {
@@ -386,6 +388,102 @@ func truncateString(s string, maxLen int) string {
 		return s
 	}
 	return string(r[:maxLen-1]) + "…"
+}
+
+func (h *prettyHandler) terminalWidth() int {
+	if raw := strings.TrimSpace(os.Getenv("ARC_LOG_WIDTH")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 60 && n <= 400 {
+			return n
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("COLUMNS")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 60 && n <= 400 {
+			return n
+		}
+	}
+	return 100
+}
+
+func wrapSegments(segments []string, sep string, maxWidth int, continuationPrefix string) []string {
+	if len(segments) == 0 {
+		return nil
+	}
+	if maxWidth < 60 {
+		maxWidth = 60
+	}
+
+	lines := make([]string, 0, 2)
+	cur := ""
+
+	for _, seg := range segments {
+		seg = truncateStyled(seg, maxWidth-2)
+		if strings.TrimSpace(stripANSI(seg)) == "" {
+			continue
+		}
+		if cur == "" {
+			cur = seg
+			continue
+		}
+		candidate := cur + sep + seg
+		if visualLen(candidate) <= maxWidth {
+			cur = candidate
+			continue
+		}
+		lines = append(lines, cur)
+		cur = continuationPrefix + seg
+	}
+
+	if cur != "" {
+		lines = append(lines, cur)
+	}
+	return lines
+}
+
+func visualLen(s string) int {
+	return len([]rune(stripANSI(s)))
+}
+
+func truncateStyled(s string, maxLen int) string {
+	if maxLen <= 0 {
+		return ""
+	}
+	plain := stripANSI(s)
+	if len([]rune(plain)) <= maxLen {
+		return s
+	}
+	return truncateString(plain, maxLen)
+}
+
+func stripANSI(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] != 0x1b {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+
+		// CSI sequence: ESC [ ... <final-byte>
+		if i+1 < len(s) && s[i+1] == '[' {
+			i += 2
+			for i < len(s) {
+				c := s[i]
+				i++
+				if c >= 0x40 && c <= 0x7e {
+					break
+				}
+			}
+			continue
+		}
+
+		// Unknown escape sequence: drop ESC + one byte if present.
+		i++
+		if i < len(s) {
+			i++
+		}
+	}
+	return b.String()
 }
 
 func levelTag(level slog.Level, color bool) string {

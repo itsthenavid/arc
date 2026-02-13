@@ -32,13 +32,52 @@ else
   c_ok=""
 fi
 
+term_width() {
+  local cols=""
+  if [[ "${COLUMNS:-}" =~ ^[0-9]+$ ]]; then
+    cols="${COLUMNS}"
+  elif command -v tput > /dev/null 2>&1; then
+    cols="$(tput cols 2> /dev/null || true)"
+  fi
+
+  if [[ ! "${cols}" =~ ^[0-9]+$ ]]; then
+    cols=100
+  fi
+  if ((cols < 68)); then
+    cols=68
+  fi
+  if ((cols > 140)); then
+    cols=140
+  fi
+
+  printf "%s" "${cols}"
+}
+
+repeat_char() {
+  local ch="${1}"
+  local n="${2}"
+  if ((n <= 0)); then
+    return
+  fi
+  local out=""
+  local i=0
+  while ((i < n)); do
+    out+="${ch}"
+    i=$((i + 1))
+  done
+  printf "%s" "${out}"
+}
+
+TERM_WIDTH="$(term_width)"
+PANEL_INNER_WIDTH=$((TERM_WIDTH - 2))
+
 label() {
   local name="${1}"
   case "${name}" in
-    INFO) printf "%s[ℹ INFO]%s" "${c_info}" "${c_reset}" ;;
-    WARN) printf "%s[⚠ WARN]%s" "${c_warn}" "${c_reset}" ;;
+    INFO) printf "%s[ℹ INFO ]%s" "${c_info}" "${c_reset}" ;;
+    WARN) printf "%s[⚠ WARN ]%s" "${c_warn}" "${c_reset}" ;;
     ERROR) printf "%s[✖ ERROR]%s" "${c_error}" "${c_reset}" ;;
-    OK) printf "%s[✔ OK]%s" "${c_ok}" "${c_reset}" ;;
+    OK) printf "%s[✔ OK   ]%s" "${c_ok}" "${c_reset}" ;;
     *) printf "[%s]" "${name}" ;;
   esac
 }
@@ -53,9 +92,30 @@ row() {
   local lvl="${1}"
   local key="${2}"
   local val="${3}"
-  printf "%s│%s %-12s %s%-14s%s %s\n" \
-    "${c_dim}" "${c_reset}" "$(label "${lvl}")" \
-    "${c_dim}" "${key}" "${c_reset}" "${val}"
+  local key_col
+  local prefix
+  local cont
+  key_col="$(printf '%-13s' "${key}")"
+  prefix="│ $(label "${lvl}") ${key_col} "
+  cont="│ $(printf '%*s' 25 '')"
+  local wrap_width=$((PANEL_INNER_WIDTH - 27))
+  if ((wrap_width < 22)); then
+    wrap_width=22
+  fi
+
+  local first=1
+  while IFS= read -r chunk || [[ -n "${chunk}" ]]; do
+    if ((first)); then
+      printf "%s%s\n" "${prefix}" "${chunk}"
+      first=0
+    else
+      printf "%s%s\n" "${cont}" "${chunk}"
+    fi
+  done < <(printf "%s" "${val}" | fold -s -w "${wrap_width}")
+
+  if ((first)); then
+    printf "%s\n" "${prefix}"
+  fi
 }
 
 host="${HTTP_ADDR%:*}"
@@ -75,7 +135,18 @@ else
   mode="postgres"
 fi
 
-printf "%s╭───────────────────────────── ✨ Arc Server Runtime ✨ ─────────────────────────────╮%s\n" "${c_dim}" "${c_reset}"
+title=" ✨ Arc Server Runtime ✨ "
+title_len=${#title}
+left_pad=$(((PANEL_INNER_WIDTH - title_len) / 2))
+if ((left_pad < 1)); then
+  left_pad=1
+fi
+right_pad=$((PANEL_INNER_WIDTH - title_len - left_pad))
+if ((right_pad < 1)); then
+  right_pad=1
+fi
+
+printf "%s┌%s%s%s┐%s\n" "${c_dim}" "$(repeat_char "─" "${left_pad}")" "${title}" "$(repeat_char "─" "${right_pad}")" "${c_reset}"
 row "INFO" "http_addr" "${HTTP_ADDR}"
 row "INFO" "mode" "${mode}"
 row "INFO" "log_level" "${LOG_LEVEL}"
@@ -94,7 +165,8 @@ fi
 if [[ "${REQUIRE_HMAC}" == "true" && ${#TOKEN_HMAC_KEY} -ge 32 ]]; then
   row "OK" "token_hmac" "token HMAC policy enabled"
 fi
-printf "%s╰─────────────────────────────────────────────────────────────────────────────────────╯%s\n" "${c_dim}" "${c_reset}"
+printf "%s└%s┘%s\n" "${c_dim}" "$(repeat_char "─" "${PANEL_INNER_WIDTH}")" "${c_reset}"
+printf "\n"
 line "OK" "🚀 launching server"
 
 export ARC_HTTP_ADDR="${HTTP_ADDR}"
