@@ -8,6 +8,32 @@ import (
 	"testing"
 )
 
+func TestRequestLogMeta(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		status     int
+		wantLevel  slog.Level
+		wantResult string
+		wantClass  string
+	}{
+		{status: 200, wantLevel: slog.LevelInfo, wantResult: "success", wantClass: "2xx"},
+		{status: 302, wantLevel: slog.LevelInfo, wantResult: "redirect", wantClass: "3xx"},
+		{status: 404, wantLevel: slog.LevelWarn, wantResult: "client_error", wantClass: "4xx"},
+		{status: 503, wantLevel: slog.LevelError, wantResult: "server_error", wantClass: "5xx"},
+	}
+
+	for _, tc := range cases {
+		level, result := requestLogMeta(tc.status)
+		if level != tc.wantLevel || result != tc.wantResult {
+			t.Fatalf("status=%d level=%v result=%q; want level=%v result=%q", tc.status, level, result, tc.wantLevel, tc.wantResult)
+		}
+		if got := statusClass(tc.status); got != tc.wantClass {
+			t.Fatalf("statusClass(%d)=%q want=%q", tc.status, got, tc.wantClass)
+		}
+	}
+}
+
 func TestWithCORS_PreflightAllowed(t *testing.T) {
 	cfg := Config{
 		CORSAllowedOrigins:   []string{"https://app.example.com"},

@@ -26,14 +26,17 @@ func WithRequestLogging(next http.Handler, log *slog.Logger) http.Handler {
 
 		next.ServeHTTP(lrw, r)
 
-		log.Info("http.request",
-			"method", r.Method,
-			"path", r.URL.Path,
-			"status", lrw.status,
-			"bytes", lrw.bytes,
-			"duration_ms", time.Since(start).Milliseconds(),
-			"remote", r.RemoteAddr,
-			"user_agent", r.UserAgent(),
+		level, result := requestLogMeta(lrw.status)
+		log.LogAttrs(r.Context(), level, "http.request",
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.Int("status", lrw.status),
+			slog.String("status_class", statusClass(lrw.status)),
+			slog.Int64("bytes", lrw.bytes),
+			slog.Int64("duration_ms", time.Since(start).Milliseconds()),
+			slog.String("remote", r.RemoteAddr),
+			slog.String("user_agent", r.UserAgent()),
+			slog.String("result", result),
 		)
 	})
 }
@@ -103,7 +106,7 @@ func WithCORS(next http.Handler, cfg Config, log *slog.Logger) http.Handler {
 		}
 
 		if _, ok := allowedOrigins[origin]; !ok {
-			log.Info("http.cors.origin_denied", "origin", origin, "path", r.URL.Path)
+			log.Warn("http.cors.origin_denied", "origin", origin, "path", r.URL.Path, "result", "client_error")
 			http.Error(w, "origin not allowed", http.StatusForbidden)
 			return
 		}
@@ -164,6 +167,34 @@ func containsString(values []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func requestLogMeta(status int) (level slog.Level, result string) {
+	switch {
+	case status >= 500:
+		return slog.LevelError, "server_error"
+	case status >= 400:
+		return slog.LevelWarn, "client_error"
+	case status >= 300:
+		return slog.LevelInfo, "redirect"
+	default:
+		return slog.LevelInfo, "success"
+	}
+}
+
+func statusClass(status int) string {
+	switch {
+	case status >= 500:
+		return "5xx"
+	case status >= 400:
+		return "4xx"
+	case status >= 300:
+		return "3xx"
+	case status >= 200:
+		return "2xx"
+	default:
+		return "1xx"
+	}
 }
 
 type loggingResponseWriter struct {

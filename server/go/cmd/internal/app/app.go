@@ -122,6 +122,7 @@ func (a *App) Run(ctx context.Context) error {
 		"healthz", baseURL+"/healthz",
 		"readyz", baseURL+"/readyz",
 		"ws", wsBaseURL(baseURL)+"/ws",
+		"result", "success",
 	)
 
 	errCh := make(chan error, 1)
@@ -133,9 +134,9 @@ func (a *App) Run(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
-		a.log.Info("server.stop", "reason", "context_done")
+		a.log.Info("server.stop", "reason", "context_done", "result", "success")
 	case err := <-errCh:
-		a.log.Error("server.fail", "err", err)
+		a.log.Error("server.fail", "err", err, "result", "server_error")
 		return err
 	}
 
@@ -143,16 +144,16 @@ func (a *App) Run(ctx context.Context) error {
 	defer cancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		a.log.Error("server.shutdown.fail", "err", err)
+		a.log.Error("server.shutdown.fail", "err", err, "result", "server_error")
 		return err
 	}
 
 	// Close store resources (pool etc).
 	if err := a.store.Close(shutdownCtx); err != nil {
-		a.log.Error("store.close.fail", "err", err)
+		a.log.Error("store.close.fail", "err", err, "result", "server_error")
 	}
 
-	a.log.Info("server.stopped")
+	a.log.Info("server.stopped", "result", "success")
 	return nil
 }
 
@@ -199,7 +200,7 @@ func wsBaseURL(httpBase string) string {
 // newStore decides between Postgres-backed persistence and in-memory dev store.
 func newStore(ctx context.Context, cfg Config, log Logger) (Store, *pgxpool.Pool, bool, realtime.MessageStore, error) {
 	if cfg.DatabaseURL == "" {
-		log.Info("db.disabled.inmemory_store")
+		log.Info("db.disabled.inmemory_store", "mode", "memory", "result", "success")
 		return nopStore{}, nil, false, realtime.NewInMemoryStore(), nil
 	}
 
@@ -208,7 +209,7 @@ func newStore(ctx context.Context, cfg Config, log Logger) (Store, *pgxpool.Pool
 		return nil, nil, false, nil, err
 	}
 
-	log.Info("db.enabled.postgres_store")
+	log.Info("db.enabled.postgres_store", "mode", "postgres", "result", "success")
 
 	// Ownership model:
 	// - app owns pool lifecycle
