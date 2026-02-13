@@ -171,9 +171,19 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	h.auditLoginSuccess(ctx, &userAuth.User.ID, issued.SessionID, ip, ua, identifier)
 
+	respSession := toSessionResponse(issued)
+	if h.shouldUseWebCookieTransport(platform) {
+		if _, err := h.setWebSessionCookies(w, issued.RefreshToken, issued.RefreshExp); err != nil {
+			h.log.Error("auth.login.web_cookie.fail", "err", err)
+			writeError(w, http.StatusInternalServerError, "server_error", "internal error")
+			return
+		}
+		respSession.RefreshToken = ""
+	}
+
 	writeJSON(w, http.StatusOK, loginResponse{
 		User:    toUserResponse(userAuth.User),
-		Session: toSessionResponse(issued),
+		Session: respSession,
 	})
 }
 
@@ -188,13 +198,26 @@ func (h *Handler) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req refreshRequest
-	if err := decodeJSON(w, r, h.cfg.MaxBodyBytes, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", "invalid request body")
-		return
+	if r.ContentLength != 0 {
+		if err := decodeJSON(w, r, h.cfg.MaxBodyBytes, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_json", "invalid request body")
+			return
+		}
 	}
 	refreshToken := strings.TrimSpace(req.RefreshToken)
+	fromCookie := false
+	if cookieToken, ok := h.refreshTokenFromCookie(r); ok {
+		fromCookie = true
+		if refreshToken == "" {
+			refreshToken = cookieToken
+		}
+	}
 	if refreshToken == "" {
 		writeError(w, http.StatusBadRequest, "invalid_request", "refresh_token is required")
+		return
+	}
+	if fromCookie && !h.csrfDoubleSubmitValid(r) {
+		writeError(w, http.StatusForbidden, "csrf_invalid", "missing or invalid csrf token")
 		return
 	}
 
@@ -227,8 +250,18 @@ func (h *Handler) handleRefresh(w http.ResponseWriter, r *http.Request) {
 
 	h.auditRefreshSuccess(ctx, issued.SessionID, ip, ua)
 
+	respSession := toSessionResponse(issued)
+	if fromCookie || h.shouldUseWebCookieTransport(dev.Platform) {
+		if _, err := h.setWebSessionCookies(w, issued.RefreshToken, issued.RefreshExp); err != nil {
+			h.log.Error("auth.refresh.web_cookie.fail", "err", err)
+			writeError(w, http.StatusInternalServerError, "server_error", "internal error")
+			return
+		}
+		respSession.RefreshToken = ""
+	}
+
 	writeJSON(w, http.StatusOK, refreshResponse{
-		Session: toSessionResponse(issued),
+		Session: respSession,
 	})
 }
 
@@ -256,6 +289,7 @@ func (h *Handler) handleLogout(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.auditLogout(ctx, claims.UserID, claims.SessionID, clientIP(r, h.cfg.TrustProxy), strings.TrimSpace(r.UserAgent()))
+	h.clearWebSessionCookies(w)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -283,6 +317,7 @@ func (h *Handler) handleLogoutAll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.auditLogoutAll(ctx, claims.UserID, clientIP(r, h.cfg.TrustProxy), strings.TrimSpace(r.UserAgent()))
+	h.clearWebSessionCookies(w)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -476,15 +511,25 @@ func (h *Handler) handleInviteConsume(w http.ResponseWriter, r *http.Request) {
 		h.insertAudit(ctx, "auth.signup", &res.User.ID, &res.Session.ID, ip, ua, nil)
 	}
 
+	respSession := sessionResponse{
+		SessionID:        res.Session.ID,
+		AccessToken:      accessToken,
+		AccessExpiresAt:  accessExp,
+		RefreshToken:     res.RefreshToken,
+		RefreshExpiresAt: res.Session.ExpiresAt,
+	}
+	if h.shouldUseWebCookieTransport(platform) {
+		if _, err := h.setWebSessionCookies(w, res.RefreshToken, res.Session.ExpiresAt); err != nil {
+			h.log.Error("auth.invite.consume.web_cookie.fail", "err", err)
+			writeError(w, http.StatusInternalServerError, "server_error", "internal error")
+			return
+		}
+		respSession.RefreshToken = ""
+	}
+
 	writeJSON(w, http.StatusOK, inviteConsumeResponse{
-		User: toUserResponse(res.User),
-		Session: sessionResponse{
-			SessionID:        res.Session.ID,
-			AccessToken:      accessToken,
-			AccessExpiresAt:  accessExp,
-			RefreshToken:     res.RefreshToken,
-			RefreshExpiresAt: res.Session.ExpiresAt,
-		},
+		User:     toUserResponse(res.User),
+		Session:  respSession,
 		InviteID: res.Invite.ID,
 	})
 }
@@ -571,9 +616,6 @@ func normalizeLoginRequest(req loginRequest) (username *string, email *string, p
 		return nil, nil, "", session.PlatformUnknown, false, false
 	}
 	platform = normalizePlatform(req.Platform)
-	if platform == session.PlatformUnknown {
-		platform = session.PlatformWeb
-	}
 	return username, email, password, platform, req.RememberMe, true
 }
 
