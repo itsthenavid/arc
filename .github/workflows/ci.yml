@@ -54,10 +54,17 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           golangci-lint version
 
+      - name: Install shfmt
+        run: |
+          set -euo pipefail
+          go install mvdan.cc/sh/v3/cmd/shfmt@v3.12.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          shfmt --version
+
       - name: Install Postgres client
         run: |
           sudo apt-get update
-          sudo apt-get install -y postgresql-client
+          sudo apt-get install -y postgresql-client shellcheck
 
       - name: Wait for Postgres
         run: |
@@ -75,11 +82,19 @@ jobs:
       - name: Quality gates (fmt)
         run: bash tools/scripts/fmt.sh
 
+      - name: Quality gates (shell)
+        run: |
+          bash tools/scripts/shfmt.sh
+          bash tools/scripts/shellcheck.sh
+
       - name: Quality gates (lint)
         run: bash tools/scripts/lint.sh
 
       - name: Quality gates (test)
         run: bash tools/scripts/test.sh
+
+      - name: Package build (server/go Dockerfile)
+        run: docker build -f server/go/Dockerfile -t arc-server:ci server/go
 
   flutter:
     name: Flutter (test)
