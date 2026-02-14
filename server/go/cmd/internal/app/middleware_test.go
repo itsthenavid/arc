@@ -91,6 +91,30 @@ func TestWithCORS_DisallowedOrigin(t *testing.T) {
 	}
 }
 
+func TestWithCORS_WildcardPortAllowed(t *testing.T) {
+	cfg := Config{
+		CORSAllowedOrigins: []string{"http://127.0.0.1:*"},
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	h := WithCORS(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}), cfg, log)
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	req.Header.Set("Origin", "http://127.0.0.1:55123")
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("expected status 204, got %d", rr.Code)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "http://127.0.0.1:55123" {
+		t.Fatalf("allow-origin mismatch: %q", got)
+	}
+}
+
 func TestWithSecurityHeaders(t *testing.T) {
 	h := WithSecurityHeaders(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)

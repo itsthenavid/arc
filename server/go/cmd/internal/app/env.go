@@ -71,6 +71,24 @@ func EnvDuration(key string, def time.Duration) time.Duration {
 	return d
 }
 
+// parseCSV parses comma-separated values and trims whitespace.
+func parseCSV(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		v := strings.TrimSpace(p)
+		if v == "" {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
 // EnvCSV reads a comma-separated list env var and returns trimmed non-empty entries.
 func EnvCSV(key string) []string {
 	v := strings.TrimSpace(os.Getenv(key))

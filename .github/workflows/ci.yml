@@ -122,6 +122,19 @@ jobs:
           channel: "stable"
           cache: true
 
+      - name: Flutter dependencies
+        working-directory: client/flutter
+        run: flutter pub get
+
+      - name: Flutter format check
+        working-directory: client/flutter
+        run: dart format --output=none --set-exit-if-changed lib test
+
+      - name: Flutter analyze
+        working-directory: client/flutter
+        run: flutter analyze --no-pub
+
       - name: Flutter tests
         working-directory: client/flutter
+        run: flutter test --no-pub
         run: flutter test

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -67,13 +68,13 @@ func WithCORS(next http.Handler, cfg Config, log *slog.Logger) http.Handler {
 		log = slog.Default()
 	}
 
-	allowedOrigins := make(map[string]struct{}, len(cfg.CORSAllowedOrigins))
+	allowedOrigins := make([]string, 0, len(cfg.CORSAllowedOrigins))
 	for _, origin := range cfg.CORSAllowedOrigins {
 		origin = strings.TrimSpace(origin)
 		if origin == "" {
 			continue
 		}
-		allowedOrigins[origin] = struct{}{}
+		allowedOrigins = append(allowedOrigins, origin)
 	}
 
 	allowedMethods := []string{http.MethodGet, http.MethodPost, http.MethodOptions}
@@ -105,7 +106,7 @@ func WithCORS(next http.Handler, cfg Config, log *slog.Logger) http.Handler {
 			return
 		}
 
-		if _, ok := allowedOrigins[origin]; !ok {
+		if !corsOriginAllowed(origin, allowedOrigins) {
 			log.Warn("http.cors.origin_denied", "origin", origin, "path", r.URL.Path, "result", "client_error")
 			http.Error(w, "origin not allowed", http.StatusForbidden)
 			return
@@ -158,6 +159,59 @@ func corsRequestHeadersAllowed(raw string, allowed map[string]struct{}) bool {
 		}
 	}
 	return true
+}
+
+func corsOriginAllowed(origin string, allowed []string) bool {
+	if len(allowed) == 0 {
+		return false
+	}
+
+	originURL, err := url.Parse(strings.TrimSpace(origin))
+	if err != nil || originURL.Scheme == "" || originURL.Host == "" {
+		return false
+	}
+	originScheme := strings.ToLower(originURL.Scheme)
+	originHost := strings.ToLower(originURL.Hostname())
+	originPort := originURL.Port()
+
+	for _, rule := range allowed {
+		rule = strings.TrimSpace(rule)
+		if rule == "" {
+			continue
+		}
+		if rule == "*" {
+			return true
+		}
+		if strings.HasSuffix(rule, ":*") {
+			base := strings.TrimSuffix(rule, ":*")
+			ru, err := url.Parse(base)
+			if err != nil || ru.Scheme == "" || ru.Host == "" {
+				continue
+			}
+			if strings.EqualFold(ru.Scheme, originScheme) &&
+				strings.EqualFold(ru.Hostname(), originHost) {
+				return true
+			}
+			continue
+		}
+
+		ru, err := url.Parse(rule)
+		if err != nil || ru.Scheme == "" || ru.Host == "" {
+			continue
+		}
+		if !strings.EqualFold(ru.Scheme, originScheme) {
+			continue
+		}
+		if !strings.EqualFold(ru.Hostname(), originHost) {
+			continue
+		}
+		if strings.TrimSpace(ru.Port()) != strings.TrimSpace(originPort) {
+			continue
+		}
+		return true
+	}
+
+	return false
 }
 
 func containsString(values []string, target string) bool {

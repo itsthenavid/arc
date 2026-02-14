@@ -19,6 +19,11 @@ type Config struct {
 	DBMinConns  int32
 
 	// Strict CORS allowlist for browser clients.
+	//
+	// Rules:
+	// - exact origin: "https://app.example.com"
+	// - wildcard port: "http://localhost:*"
+	// - wildcard all: "*" (not recommended with credentials)
 	CORSAllowedOrigins   []string
 	CORSAllowCredentials bool
 	CORSMaxAgeSeconds    int
@@ -34,6 +39,12 @@ type Config struct {
 
 // LoadConfig loads Config from environment variables with defaults.
 func LoadConfig() Config {
+	corsDefault := "http://localhost:*,http://127.0.0.1:*"
+	corsRaw := EnvString("ARC_HTTP_CORS_ALLOWED_ORIGINS", "")
+	if corsRaw == "" {
+		corsRaw = EnvString("ARC_CORS_ALLOWED_ORIGINS", corsDefault)
+	}
+
 	return Config{
 		HTTPAddr:  EnvString("ARC_HTTP_ADDR", "0.0.0.0:8080"),
 		LogLevel:  EnvString("ARC_LOG_LEVEL", "info"),
@@ -50,7 +61,7 @@ func LoadConfig() Config {
 		DBMaxConns:  EnvInt32("ARC_DB_MAX_CONNS", 10),
 		DBMinConns:  EnvInt32("ARC_DB_MIN_CONNS", 0),
 
-		CORSAllowedOrigins:   EnvCSV("ARC_HTTP_CORS_ALLOWED_ORIGINS"),
+		CORSAllowedOrigins:   parseCSV(corsRaw),
 		CORSAllowCredentials: EnvBool("ARC_HTTP_CORS_ALLOW_CREDENTIALS", true),
 		CORSMaxAgeSeconds:    EnvInt("ARC_HTTP_CORS_MAX_AGE_SECONDS", 600),
 
