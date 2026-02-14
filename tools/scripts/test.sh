@@ -28,7 +28,11 @@ if command -v flutter > /dev/null 2>&1; then
       echo "test: flutter (client/flutter)"
       (
         cd "$ROOT_DIR/client/flutter"
-        flutter test
+        if [[ "${ARC_FLUTTER_TEST_WITH_PUB:-false}" == "true" ]]; then
+          flutter test
+        else
+          flutter test --no-pub
+        fi
       )
     else
       echo "SKIP: flutter (client/flutter) - flutter not usable (check permissions/update)"

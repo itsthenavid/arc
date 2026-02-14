@@ -23,6 +23,17 @@ if is_tcp_port_listening "127.0.0.1" "$REDIS_PORT"; then
   REDIS_PORT="$(pick_free_port 6379)"
 fi
 
+# Avoid host-port collision when both fall back to the ephemeral range.
+if [[ "${POSTGRES_PORT}" == "${REDIS_PORT}" ]]; then
+  while true; do
+    candidate="$(pick_free_port 6379)"
+    if [[ "${candidate}" != "${POSTGRES_PORT}" ]]; then
+      REDIS_PORT="${candidate}"
+      break
+    fi
+  done
+fi
+
 export POSTGRES_PORT REDIS_PORT
 
 INFRA_ENV_FILE="$(infra_env_path)"
