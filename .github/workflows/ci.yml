@@ -137,4 +137,3 @@ jobs:
       - name: Flutter tests
         working-directory: client/flutter
         run: flutter test --no-pub
-        run: flutter test
